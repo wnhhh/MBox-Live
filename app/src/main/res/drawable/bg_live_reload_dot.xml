@@ -1,0 +1,14 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- "刷新按钮已隐藏"时原地留下的小圆点:28dp 的点击区里只画 10dp 的实心圆,
+     既能看见位置,又不会挡住画面 -->
+<layer-list xmlns:android="http://schemas.android.com/apk/res/android">
+    <item
+        android:left="9dp"
+        android:top="9dp"
+        android:right="9dp"
+        android:bottom="9dp">
+        <shape android:shape="oval">
+            <solid android:color="#B3FFFFFF" />
+        </shape>
+    </item>
+</layer-list>
