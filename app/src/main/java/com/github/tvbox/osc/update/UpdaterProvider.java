@@ -33,7 +33,10 @@ public final class UpdaterProvider {
         if (UpdaterConfig.SOURCE_GITHUB.equals(source)) {
             return new com.github.tvbox.osc.update.github.GithubReleaseUpdater();
         }
-        // 未知实现回退 GitHub,保证"检查更新"始终可用
-        return new com.github.tvbox.osc.update.github.GithubReleaseUpdater();
+        if (UpdaterConfig.SOURCE_HTTP.equals(source)) {
+            return new com.github.tvbox.osc.update.http.HttpManifestUpdater();
+        }
+        // 默认/未知配置:GitHub Releases 优先,自建清单兜底
+        return com.github.tvbox.osc.update.FallbackUpdater.defaults();
     }
 }

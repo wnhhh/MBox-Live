@@ -169,6 +169,10 @@ public final class UpdateManager {
         }
     }
 
+    /** 下载 APK 时使用的 UA:部分防护层(如京东云 JDTP)会拦非浏览器 UA,统一伪装成移动浏览器 */
+    public static final String DOWNLOAD_UA =
+            "Mozilla/5.0 (Linux; Android 13) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0 Mobile Safari/537.36";
+
     /** 安装已下载的 APK(经系统安装器;API26+ 先校验"安装未知应用"授权) */
     public boolean installCurrent(Context context) {
         Context ctx = context != null ? context.getApplicationContext() : appContext;
@@ -303,7 +307,8 @@ public final class UpdateManager {
         OutputStream fos = null;
         InputStream is = null;
         try {
-            Request.Builder rb = new Request.Builder().url(url);
+            Request.Builder rb = new Request.Builder().url(url)
+                    .header("User-Agent", DOWNLOAD_UA);
             if (startFrom > 0) {
                 rb.header("Range", "bytes=" + startFrom + "-");
             }
@@ -438,6 +443,11 @@ public final class UpdateManager {
         try {
             if (Build.VERSION.SDK_INT >= 26) {
                 if (!context.getPackageManager().canRequestPackageInstalls()) {
+                    // 静默跳设置页会让用户以为"点了安装没反应",这里必须先说清楚
+                    try {
+                        com.github.tvbox.osc.util.AppBubble.toastLong("请先允许「安装未知应用」,再重新点击安装");
+                    } catch (Throwable ignored) {
+                    }
                     try {
                         Intent intent = new Intent(
                                 android.provider.Settings.ACTION_MANAGE_UNKNOWN_APP_SOURCES,

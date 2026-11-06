@@ -10,23 +10,37 @@ import com.github.tvbox.osc.config.PrefsDataStore;
  */
 public final class UpdaterConfig {
 
-    /** 当前默认实现:GitHub Releases */
+    /** 默认实现:GitHub Releases 为主 + 自建清单兜底（国内访问 api.github.com 不通时自动切换） */
+    public static final String SOURCE_AUTO = "auto";
+
+    /** 仅用 GitHub Releases */
     public static final String SOURCE_GITHUB = "github";
 
+    /** 仅用自建 HTTP 清单 */
+    public static final String SOURCE_HTTP = "http";
+
     /**
-     * 项目仓库默认坐标(仓库 {@code CNShanJu/MBox},原名 {@code CNShanJu/TVBoxOS-Mobile})。
+     * 默认更新清单地址(自建静态站点)。
      * <p>
-     * 更名前发布的老安装包内置坐标仍是旧仓库名;GitHub 对更名后的仓库保留 301 重定向,而本 App 的
-     * 检查更新与 APK 下载都走 {@code network().general()}(followRedirects=true),因此老包仍能查到并下载
-     * 新仓库的 Release——发版时无需为老包额外做兼容。
+     * 清单里声明最新 versionCode / versionName / APK 地址 / 更新说明,App 只认 versionCode 比较;
+     * 发版流程:替换 APK → 改这份 update.json → 客户端下次检查即可一键升级。
      */
-    public static final String DEFAULT_GITHUB_OWNER = "CNShanJu";
-    public static final String DEFAULT_GITHUB_REPO = "MBox";
+    public static final String DEFAULT_MANIFEST_URL = "http://111.228.23.40/mbox/update.json";
+
+    /**
+     * 更新仓库默认坐标:{@code wnhhh/MBox-Live} 的 Releases 就是 APK 的分发点。
+     * <p>
+     * 发版只需在该仓库打一个 {@code v*} tag:仓库自带的 GitHub Actions(build-apk.yml)会构建 APK
+     * 并自动创建 Release、挂上安装包;客户端读 {@code /releases} 列表比对版本,下载走 gh-proxy 加速。
+     */
+    public static final String DEFAULT_GITHUB_OWNER = "wnhhh";
+    public static final String DEFAULT_GITHUB_REPO = "MBox-Live";
 
     /** 默认 GitHub 下载加速前缀(形如 https://gh-proxy.org/);空串=不使用代理,仅直连 */
     public static final String DEFAULT_GITHUB_DOWNLOAD_PROXY = "https://gh-proxy.org/";
 
     private static final String KEY_SOURCE = "update_source";
+    private static final String KEY_MANIFEST_URL = "update_manifest_url";
     private static final String KEY_GITHUB_OWNER = "update_github_owner";
     private static final String KEY_GITHUB_REPO = "update_github_repo";
     private static final String KEY_GITHUB_DOWNLOAD_PROXY = "update_github_download_proxy";
@@ -34,14 +48,24 @@ public final class UpdaterConfig {
     private UpdaterConfig() {
     }
 
-    /** 更新实现标识,默认 {@link #SOURCE_GITHUB} */
+    /** 更新实现标识,默认 {@link #SOURCE_AUTO}（GitHub 优先、自建清单兜底） */
     public static String getSource() {
-        String s = PrefsDataStore.getString(KEY_SOURCE, SOURCE_GITHUB);
-        return s == null || s.trim().isEmpty() ? SOURCE_GITHUB : s.trim();
+        String s = PrefsDataStore.getString(KEY_SOURCE, SOURCE_AUTO);
+        return s == null || s.trim().isEmpty() ? SOURCE_AUTO : s.trim();
     }
 
     public static void setSource(String source) {
-        PrefsDataStore.put(KEY_SOURCE, source == null || source.trim().isEmpty() ? SOURCE_GITHUB : source.trim());
+        PrefsDataStore.put(KEY_SOURCE, source == null || source.trim().isEmpty() ? SOURCE_AUTO : source.trim());
+    }
+
+    /** 自建更新清单地址,默认 {@value #DEFAULT_MANIFEST_URL} */
+    public static String getManifestUrl() {
+        String v = PrefsDataStore.getString(KEY_MANIFEST_URL, DEFAULT_MANIFEST_URL);
+        return v == null ? DEFAULT_MANIFEST_URL : v.trim();
+    }
+
+    public static void setManifestUrl(String url) {
+        PrefsDataStore.put(KEY_MANIFEST_URL, url == null ? DEFAULT_MANIFEST_URL : url.trim());
     }
 
     /** GitHub 仓库 owner,默认 {@value #DEFAULT_GITHUB_OWNER} */

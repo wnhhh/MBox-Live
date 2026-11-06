@@ -154,6 +154,14 @@ public final class UpdateCheck {
 
             @Override
             public void onDownloadReady(UpdateInfo i) {
+                // 用户点过"立即更新"就算表过态了:下载完直接拉起系统安装器,不用再点一次悬浮圈。
+                // 留 700ms 让进度圈先画出"已完成",避免刚下完就跳安装页显得突兀。
+                MAIN.postDelayed(new Runnable() {
+                    @Override
+                    public void run() {
+                        UpdateManager.get().installCurrent(context);
+                    }
+                }, 700L);
             }
 
             @Override
