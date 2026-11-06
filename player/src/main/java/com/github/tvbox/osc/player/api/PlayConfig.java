@@ -50,9 +50,9 @@ public final class PlayConfig {
 
     // ── 查询 ──
 
-    /** 默认播放器：0 系统 1 IJK 2 Exo 10 MX...，默认 0 */
+    /** 默认播放器：0 系统 1 IJK 2 Exo 10 MX...，默认 1(IJK：直播起流稳、兼容性最好) */
     public static int getPlayType() {
-        return PrefsDataStore.getInt(KEY_PLAY_TYPE, 0);
+        return PrefsDataStore.getInt(KEY_PLAY_TYPE, 1);
     }
 
     /** 渲染方式：0 texture 1 surface，默认 0 */

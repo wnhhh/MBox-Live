@@ -8,6 +8,7 @@ import android.text.TextUtils;
 import android.util.Base64;
 import android.view.Gravity;
 import android.view.KeyEvent;
+import android.view.MotionEvent;
 import android.view.View;
 import android.view.View.OnClickListener;
 import android.widget.FrameLayout;
@@ -22,6 +23,7 @@ import androidx.recyclerview.widget.RecyclerView;
 import com.blankj.utilcode.util.ConvertUtils;
 import com.blankj.utilcode.util.ScreenUtils;
 import com.github.tvbox.osc.util.AppBubble;
+import com.github.tvbox.osc.util.PermissionGuide;
 import com.chad.library.adapter.base.BaseQuickAdapter;
 import com.github.tvbox.osc.R;
 import com.github.tvbox.osc.base.App;
@@ -146,6 +148,43 @@ public class LiveActivity extends BaseActivity implements LiveLineSelectHost, Li
     /** 上次上下滑换台的时刻(防抖,避免一次滑动连跳多个台) */
     private long lastFlingSwitchAt = 0L;
 
+    // ── 换台预加载(抖音式秒切):下一个台提前建连+解封装,换台时直接扶正实例 ──
+    /** 起播稳定后延迟多久开始预加载下一个台:太快会和当前台的缓冲抢带宽 */
+    private static final long PRELOAD_DELAY_MS = 1200L;
+    /** 预加载过期补刷节奏:直播流放久了连接会僵,定期重新准备一次 */
+    private static final long PRELOAD_REFRESH_MS = 60 * 1000L;
+    /** 预加载失败退避:死链别每次起播都白建连 */
+    private static final long PRELOAD_FAIL_BACKOFF_MS = 5 * 60 * 1000L;
+    /** 上次换台方向(+1 下一个台 / -1 上一个台):决定预加载哪一侧 */
+    private int lastZapDirection = 1;
+    private String preloadFailUrl = null;
+    private long preloadFailAt = 0L;
+    /** 是否已挂着一个待执行的预加载任务(避免频繁的 buffer 回调把定时器一直往后推) */
+    private boolean preloadScheduled = false;
+    /** 启动自动检查更新是否已安排(每个页面实例只安排一次) */
+    private boolean updateCheckScheduled = false;
+
+    private final Runnable mPreloadRun = new Runnable() {
+        @Override
+        public void run() {
+            preloadScheduled = false;
+            preloadNeighborChannel();
+        }
+    };
+    private final Runnable mPreloadRefreshRun = new Runnable() {
+        @Override
+        public void run() {
+            preloadNeighborChannel();
+            mHandler.postDelayed(this, PRELOAD_REFRESH_MS);
+        }
+    };
+
+    /** 视频区换台手势:本次按下是否已接管 */
+    private boolean zapGestureTracking = false;
+    private float zapDownRawX = 0f;
+    private float zapDownRawY = 0f;
+    private final int[] zapVideoLocation = new int[2];
+
     @Override
     protected int getLayoutResID() {
         return R.layout.activity_live;
@@ -167,6 +206,20 @@ public class LiveActivity extends BaseActivity implements LiveLineSelectHost, Li
 
         setLoadSir(findViewById(R.id.live_root));
         mVideoView = findViewById(R.id.mVideoView);
+        // 预加载结果只用来记日志和做失败退避,不影响播放流程
+        mVideoView.setOnPreloadListener(new VideoView.OnPreloadListener() {
+            @Override
+            public void onPreloadReady(String url) {
+                AppLog.log("直播", "预加载就绪: " + url);
+            }
+
+            @Override
+            public void onPreloadFailed(String url) {
+                preloadFailUrl = url;
+                preloadFailAt = SystemClock.elapsedRealtime();
+                AppLog.log("直播", "预加载失败(退避 5 分钟): " + url);
+            }
+        });
 
         tvLeftChannelListLayout = findViewById(R.id.tvLeftChannnelListLayout);
 
@@ -466,6 +519,26 @@ public class LiveActivity extends BaseActivity implements LiveLineSelectHost, Li
                 scheduleNextAutoReload(AUTO_RELOAD_INTERVAL_MS - age);
             }
         }
+
+        // 回到前台:恢复换台预加载(后台期间是停掉的)
+        mHandler.removeCallbacks(mPreloadRefreshRun);
+        if (LiveConfig.preloadEnabled()) {
+            schedulePreloadNeighbor(PRELOAD_DELAY_MS);
+            mHandler.postDelayed(mPreloadRefreshRun, PRELOAD_REFRESH_MS);
+        }
+
+        // 进前台 5 秒后查一次更新(不依赖起播是否成功,源挂了也能收到升级提示)
+        scheduleUpdateCheck();
+
+        // 特殊权限(所有文件访问 / 安装未知应用)系统不会弹授权框,只能主动引导;
+        // 延迟一点,等直播页画面起来、频道表开始加载之后再弹,别和首屏抢焦点
+        mHandler.postDelayed(new Runnable() {
+            @Override
+            public void run() {
+                if (isFinishing() || isDestroyed()) return;
+                PermissionGuide.checkAndGuide(LiveActivity.this);
+            }
+        }, 900L);
     }
 
 
@@ -474,7 +547,12 @@ public class LiveActivity extends BaseActivity implements LiveLineSelectHost, Li
         super.onPause();
         // 后台不刷新:既省电省流量,也避免回来时列表和"正在播的台"对不上
         mHandler.removeCallbacks(mAutoReloadRun);
+        // 后台不预加载:省流量,也别留一路连接在后台挂着
+        mHandler.removeCallbacks(mPreloadRun);
+        mHandler.removeCallbacks(mPreloadRefreshRun);
+        preloadScheduled = false;
         if (mVideoView != null) {
+            mVideoView.cancelPreload();
             mVideoView.pause();
         }
     }
@@ -543,13 +621,18 @@ public class LiveActivity extends BaseActivity implements LiveLineSelectHost, Li
                 return true;
             }
         }
-        mVideoView.release();
+        // 换台前先看这个台有没有自己的内核/渲染配置(改了就必须重建,不能复用实例)
+        boolean kernelChanged = false;
         if (!changeSource) {
             currentChannelGroupIndex = channelGroupIndex;
             currentLiveChannelIndex = liveChannelIndex;
             currentLiveChannelItem = getLiveChannels(currentChannelGroupIndex).get(currentLiveChannelIndex);
             LiveConfig.setLastChannel(currentLiveChannelItem.getChannelName());
             livePlayerManager.getLiveChannelPlayer(mVideoView, currentLiveChannelItem.getChannelName());
+            kernelChanged = livePlayerManager.consumeRebuildRequired();
+            if (kernelChanged) mVideoView.cancelPreload();
+        } else {
+            livePlayerManager.consumeRebuildRequired();   // 线路切换不动内核,清掉残留标记
         }
 
         channel_Name = currentLiveChannelItem;
@@ -561,26 +644,46 @@ public class LiveActivity extends BaseActivity implements LiveLineSelectHost, Li
         }
         showBottomEpg();
 
-        AppLog.log("直播", "播放频道[" + currentLiveChannelItem.getChannelName() + "] 源[" + (currentLiveChannelItem.getSourceIndex() + 1) + "/" + currentLiveChannelItem.getSourceNum() + "] " + currentLiveChannelItem.getUrl());
+        final String url = currentLiveChannelItem.getUrl();
+        AppLog.log("直播", "播放频道[" + currentLiveChannelItem.getChannelName() + "] 源[" + (currentLiveChannelItem.getSourceIndex() + 1) + "/" + currentLiveChannelItem.getSourceNum() + "] " + url);
         com.github.tvbox.osc.log.LogStore.log(com.github.tvbox.osc.log.Category.OTHER,
                 "直播: 播放频道[" + currentLiveChannelItem.getChannelName() + "] 源["
                         + (currentLiveChannelItem.getSourceIndex() + 1) + "/"
                         + currentLiveChannelItem.getSourceNum() + "]");
 
-        mVideoView.setUrl(currentLiveChannelItem.getUrl());
-       // showChannelInfo();
+        // 起播三条路,从快到慢:
+        // 1) 预加载命中 → 直接把提前备好的实例扶正(不重建播放器、不重建 Surface)
+        // 2) 没命中 → 复用当前实例 reset 换源(省掉实例重建和 TextureView 重建)
+        // 3) 内核换了/实例不可用 → 老路径:销毁重建
+        boolean promoted = !kernelChanged
+                && LiveConfig.preloadEnabled()
+                && LiveConfig.channelPlayerConfig(currentLiveChannelItem.getChannelName()) == null
+                && mVideoView.promotePreloadedIfMatches(url);
+        if (promoted) {
+            AppLog.log("直播", "换台命中预加载,直接扶正: " + currentLiveChannelItem.getChannelName());
+            com.github.tvbox.osc.log.LogStore.log(com.github.tvbox.osc.log.Category.OTHER,
+                    "直播: 换台命中预加载[" + currentLiveChannelItem.getChannelName() + "]");
+        } else if (kernelChanged || !mVideoView.switchUrl(url, null)) {
+            mVideoView.release();
+            mVideoView.setUrl(url);
+        }
         mVideoView.start();
+
+        // 当前台起播稳定后,提前把下一个台准备好(抖音式预加载)
+        schedulePreloadNeighbor(PRELOAD_DELAY_MS);
         return true;
     }
 
     private void playNext() {
         if (!isCurrentLiveChannelValid()) return;
+        lastZapDirection = 1;
         Integer[] groupChannelIndex = getNextChannel(1);
         playChannel(groupChannelIndex[0], groupChannelIndex[1], false);
     }
 
     private void playPrevious() {
         if (!isCurrentLiveChannelValid()) return;
+        lastZapDirection = -1;
         Integer[] groupChannelIndex = getNextChannel(-1);
         playChannel(groupChannelIndex[0], groupChannelIndex[1], false);
     }
@@ -673,10 +776,17 @@ public class LiveActivity extends BaseActivity implements LiveLineSelectHost, Li
                     case VideoView.STATE_PAUSED:
                         break;
                     case VideoView.STATE_PREPARED:
+                        currentLiveChangeSourceTimes = 0;
+                        mHandler.removeCallbacks(mConnectTimeoutChangeSourceRun);
+                        break;
                     case VideoView.STATE_BUFFERED:
                     case VideoView.STATE_PLAYING:
                         currentLiveChangeSourceTimes = 0;
                         mHandler.removeCallbacks(mConnectTimeoutChangeSourceRun);
+                        // 画面出来了才预加载下一个台,免得和当前台的起流抢带宽
+                        schedulePreloadNeighbor(PRELOAD_DELAY_MS);
+                        // 起播稳定后再查更新:别和首屏抢带宽/弹窗抢焦点
+                        scheduleUpdateCheck();
                         break;
                     case VideoView.STATE_ERROR:
                     case VideoView.STATE_PLAYBACK_COMPLETED:
@@ -702,11 +812,7 @@ public class LiveActivity extends BaseActivity implements LiveLineSelectHost, Li
 
             @Override
             public void changeChannel(int direction) {
-                // 上下滑换台:350ms 防抖,免得一次滑动被识别成两次、连着跳过好几个台
-                long now = SystemClock.elapsedRealtime();
-                if (now - lastFlingSwitchAt < 350L) return;
-                lastFlingSwitchAt = now;
-                zapChannel(direction);
+                zapByGesture(direction);
             }
         });
         controller.setCanChangePosition(false);
@@ -796,6 +902,10 @@ public class LiveActivity extends BaseActivity implements LiveLineSelectHost, Li
         }
         if (groupIndex < 0 || groupIndex >= liveChannelGroupList.size()) return;
         if (position < 0 || position >= getLiveChannels(groupIndex).size()) return;
+        // 列表点选也记一下方向:预加载会按"下一个台"准备
+        if (groupIndex == currentChannelGroupIndex && position != currentLiveChannelIndex) {
+            lastZapDirection = position > currentLiveChannelIndex ? 1 : -1;
+        }
         liveChannelItemAdapter.setSelectedChannelIndex(position);
         playChannel(groupIndex, position, false);
     }
@@ -1142,8 +1252,160 @@ public class LiveActivity extends BaseActivity implements LiveLineSelectHost, Li
     /** 上下滑换台:跨组连续换,到列表尾回卷 */
     private void zapChannel(int direction) {
         if (!isCurrentLiveChannelValid()) return;
+        lastZapDirection = direction;
         Integer[] groupChannelIndex = getNextChannel(direction, true);
         playChannel(groupChannelIndex[0], groupChannelIndex[1], false);
+    }
+
+    /** 手势换台统一入口:页面级与控制器共用,350ms 防抖保证一次滑动只切一个台 */
+    private void zapByGesture(int direction) {
+        long now = SystemClock.elapsedRealtime();
+        if (now - lastFlingSwitchAt < 350L) return;
+        lastFlingSwitchAt = now;
+        zapChannel(direction);
+    }
+
+    // ------------------------------------------------------------------
+    // 换台预加载调度(抖音式:下一个台提前起流,换台直接扶正)
+    // ------------------------------------------------------------------
+
+    /** 安排一次"预加载下一个台";已有待执行任务时不重复排(频繁 buffer 回调不会把定时器一直往后推) */
+    private void schedulePreloadNeighbor(long delayMs) {
+        if (!LiveConfig.preloadEnabled()) return;
+        if (preloadScheduled) return;
+        preloadScheduled = true;
+        mHandler.postDelayed(mPreloadRun, Math.max(200L, delayMs));
+    }
+
+    /**
+     * 预加载"下一次换台最可能去的那个台"。
+     * 只做 prepare(静音、不出画面),换台时由 VideoView 直接把实例扶正,省掉建连和探测。
+     */
+    private void preloadNeighborChannel() {
+        if (mVideoView == null || isFinishing() || isDestroyed()) return;
+        if (!LiveConfig.preloadEnabled()) {
+            mVideoView.cancelPreload();
+            return;
+        }
+        if (currentLiveChannelItem == null || liveChannelGroupList.isEmpty()) return;
+
+        Integer[] next = getNextChannel(lastZapDirection, true);
+        if (next[0] < 0 || next[0] >= liveChannelGroupList.size()) return;
+        ArrayList<LiveChannelItem> channels = getLiveChannels(next[0]);
+        if (next[1] < 0 || next[1] >= channels.size()) return;
+
+        LiveChannelItem item = channels.get(next[1]);
+        if (item == null || TextUtils.isEmpty(item.getUrl())) return;
+        if (item.getUrl().equals(currentLiveChannelItem.getUrl())) return;
+
+        // 这个台有自己的内核覆写:预加载实例的内核可能对不上,宁可冷启动也别扶正后黑屏
+        if (LiveConfig.channelPlayerConfig(item.getChannelName()) != null) {
+            mVideoView.cancelPreload();
+            return;
+        }
+        // 同一个地址刚失败过:退避期内不再重试,免得死链每次起播都白建一次连
+        if (preloadFailUrl != null && preloadFailUrl.equals(item.getUrl())
+                && SystemClock.elapsedRealtime() - preloadFailAt < PRELOAD_FAIL_BACKOFF_MS) {
+            return;
+        }
+        if (mVideoView.preload(item.getUrl(), null)) {
+            AppLog.log("直播", "预加载下一个台[" + item.getChannelName() + "] 方向=" + lastZapDirection);
+        }
+    }
+
+    @Override
+    public void onPreloadSettingChanged() {
+        if (mVideoView == null) return;
+        if (!LiveConfig.preloadEnabled()) {
+            mHandler.removeCallbacks(mPreloadRun);
+            mHandler.removeCallbacks(mPreloadRefreshRun);
+            preloadScheduled = false;
+            mVideoView.cancelPreload();
+            AppBubble.toast("已关闭换台预加载");
+            return;
+        }
+        // 打开后立刻补一次,并恢复过期补刷
+        schedulePreloadNeighbor(300L);
+        mHandler.removeCallbacks(mPreloadRefreshRun);
+        mHandler.postDelayed(mPreloadRefreshRun, PRELOAD_REFRESH_MS);
+        AppBubble.toast("已开启换台预加载");
+    }
+
+    // ------------------------------------------------------------------
+    // 在线升级
+    // ------------------------------------------------------------------
+
+    /** 起播稳定后做一次"启动自动检查更新"(每进程一次,受设置里"自动检查更新"开关控制) */
+    private void scheduleUpdateCheck() {
+        if (updateCheckScheduled) return;
+        updateCheckScheduled = true;
+        mHandler.postDelayed(new Runnable() {
+            @Override
+            public void run() {
+                if (isFinishing() || isDestroyed()) return;
+                com.github.tvbox.osc.update.UpdateCheck.autoCheckOnce(LiveActivity.this, null);
+            }
+        }, 5000L);
+    }
+
+    /** 设置面板里的"检查更新"动作项:结果走统一的更新说明弹窗 */
+    @Override
+    public void checkUpdate() {
+        if (isFinishing() || isDestroyed()) return;
+        AppBubble.toast("正在检查更新…");
+        com.github.tvbox.osc.update.UpdateCheck.check(this, null);
+    }
+
+    /**
+     * 视频区手势换台(页面级),不依赖播放器状态机。
+     * <p>
+     * 只靠控制器 onFling 不够:控制器的滑动链路要过播放状态判断(见 BaseController.onScroll),
+     * 起播/缓冲阶段——也就是画面在转圈的时候——会直接 return,这个阶段恰恰是发现死台后最想滑走的时候。
+     * 这里在 Activity 分发阶段就接管"视频区内 + 横向中间 1/3 + 竖向滑动",任何播放状态都能换台;
+     * 左 1/3 亮度、右 1/3 音量仍交回控制器,互不干扰。
+     */
+    @Override
+    public boolean dispatchTouchEvent(MotionEvent ev) {
+        switch (ev.getActionMasked()) {
+            case MotionEvent.ACTION_DOWN:
+                // 起点必须落在视频区中段;下面的频道列表区域一律不接管,免得影响滚动
+                zapGestureTracking = isInVideoZapZone(ev.getRawX(), ev.getRawY());
+                zapDownRawX = ev.getRawX();
+                zapDownRawY = ev.getRawY();
+                break;
+            case MotionEvent.ACTION_UP:
+                if (zapGestureTracking) {
+                    zapGestureTracking = false;
+                    float dx = ev.getRawX() - zapDownRawX;
+                    float dy = ev.getRawY() - zapDownRawY;
+                    // 48dp 起判:比控制器的 100px 更贴合"短促一划"的手感,也不会把点按当成滑动
+                    float minDistance = 48f * getResources().getDisplayMetrics().density;
+                    if (Math.abs(dy) >= minDistance && Math.abs(dy) > Math.abs(dx)) {
+                        zapByGesture(dy < 0 ? 1 : -1); // 上滑下一个台,下滑上一个台
+                        return true;                   // 吃掉 UP:控制器收不到 UP,自然不会重复切一次
+                    }
+                }
+                break;
+            case MotionEvent.ACTION_CANCEL:
+                zapGestureTracking = false;
+                break;
+            default:
+                break;
+        }
+        return super.dispatchTouchEvent(ev);
+    }
+
+    /** 按下的点是否在「视频区 + 横向中间 1/3」内 */
+    private boolean isInVideoZapZone(float rawX, float rawY) {
+        if (mVideoView == null || !mVideoView.isShown()) return false;
+        int w = mVideoView.getWidth();
+        int h = mVideoView.getHeight();
+        if (w <= 0 || h <= 0) return false;
+        mVideoView.getLocationOnScreen(zapVideoLocation);
+        int left = zapVideoLocation[0];
+        int top = zapVideoLocation[1];
+        if (rawX < left || rawX > left + w || rawY < top || rawY > top + h) return false;
+        return rawX >= left + w / 3f && rawX <= left + w * 2f / 3f;
     }
 
     private int getFirstNoPasswordChannelGroup() {

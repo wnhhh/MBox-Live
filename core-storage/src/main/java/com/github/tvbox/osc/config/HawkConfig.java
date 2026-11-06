@@ -88,4 +88,8 @@ public class HawkConfig {
      * 直播页"刷新直播源"按钮是否已隐藏(长按按钮隐藏;隐藏后同位置留一个小圆点,单击即恢复)
      */
     public static final String LIVE_RELOAD_BTN_HIDDEN = "live_reload_btn_hidden";
+    /**
+     * 换台预加载开关(默认开):下一个台提前起流,换台时直接扶正,像短视频一样秒切
+     */
+    public static final String LIVE_PRELOAD = "live_preload";
 }

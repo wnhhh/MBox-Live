@@ -165,8 +165,8 @@ public class App extends MultiDexApplication {
         com.github.tvbox.osc.config.PrefsDataStore.put(HawkConfig.DEBUG_OPEN, false);
 
         putDefault(HawkConfig.HOME_REC, 0);                  //推荐: 0=豆瓣热播, 1=站点推荐
-        putDefault(HawkConfig.PLAY_TYPE, 2);                 //播放器: 0=系统, 1=IJK, 2=Exo
-        putDefault(HawkConfig.IJK_CODEC, "硬解码");           //IJK解码: 软解码, 硬解码
+        putDefault(HawkConfig.PLAY_TYPE, 1);                 //播放器: 0=系统, 1=IJK, 2=Exo(直播默认 IJK)
+        putDefault(HawkConfig.IJK_CODEC, "软解码");           //IJK解码: 软解码, 硬解码(默认软解,兼容性最好)
         putDefault(HawkConfig.BACKGROUND_PLAY_TYPE,2);           //后台播放: 0 关闭,1 开启,2 画中画
         putDefault(HawkConfig.DOH_URL, 0);                   //安全DNS: 0=关闭, 1=腾讯, 2=阿里, 3=360, 4=Google, 5=AdGuard, 6=Quad9
         putDefault(HawkConfig.PLAY_SCALE, 0);                //画面缩放: 0=默认, 1=16:9, 2=4:3, 3=填充, 4=原始, 5=裁剪
@@ -177,6 +177,7 @@ public class App extends MultiDexApplication {
         putDefault(HawkConfig.LAN_SERVER_ENABLE, false);      //局域网服务:默认关闭(HTTP 服务仅监听 127.0.0.1)
         putDefault(HawkConfig.LOADING_ANIM, "");               //加载动画:空=默认,或 assets/loading/ 下的文件名
         putDefault(HawkConfig.LIVE_URL, com.github.tvbox.osc.util.DefaultConfig.DEFAULT_LIVE_URL); //直播源:内置默认地址(IPTV 频道表)
+        migratePlayerDefaultsOnce();
         putDefaultApi();
         // 日志模块初始化:按 LogConfig 同步开关(默认关),开启时自动启动 logcat 捕获(package:mine)
         // 注入版本号:日志行首展示(定位问题时确认是哪个版本产生)
@@ -191,8 +192,29 @@ public class App extends MultiDexApplication {
         LogStore.init(this);
     }
 
-    private void putDefaultApi() {
-        // 本机调试用的默认订阅清单是"默认订阅"的唯一来源(只放 debug 源集,release 包与克隆仓库都没有):
+    /**
+     * 播放内核默认值一次性迁移（换台预加载版本起）。
+     * <p>
+     * 老版本首次启动会把 play_type 种成 2(Exo)、ijk_codec 种成「硬解码」，直播起流慢、部分盒子硬解兼容性差。
+     * 这里只在值仍等于老种子时迁到 IJK + 软解，迁过一次就打标记——之后用户在设置里怎么改都不再干预。
+     */
+    private void migratePlayerDefaultsOnce() {
+        final String migratedKey = "player_default_ijk_migrated";
+        try {
+            if (com.github.tvbox.osc.config.PrefsDataStore.contains(migratedKey)) return;
+            if (com.github.tvbox.osc.player.api.PlayConfig.getPlayType() == 2) {
+                com.github.tvbox.osc.player.api.PlayConfig.setPlayType(1);
+            }
+            if ("硬解码".equals(com.github.tvbox.osc.player.api.PlayConfig.getIjkCodec())) {
+                com.github.tvbox.osc.player.api.PlayConfig.setIjkCodec("软解码");
+            }
+            com.github.tvbox.osc.config.PrefsDataStore.put(migratedKey, true);
+        } catch (Throwable th) {
+            th.printStackTrace();
+        }
+    }
+
+    private void putDefaultApi() {        // 本机调试用的默认订阅清单是"默认订阅"的唯一来源(只放 debug 源集,release 包与克隆仓库都没有):
         // 文件在 -> 每次启动与列表同步(只增删**我们注入过**的条目,用户自建/改名的订阅一律不动);
         // 文件不在 -> 既不注入也不移除,完全尊重用户现有列表。
         List<Subscription> defaults = readDefaultSubscriptions();

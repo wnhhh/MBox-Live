@@ -82,7 +82,7 @@ final class LiveSettingPanel {
         items.add(new ArrayList<>(Arrays.asList("默认", "16:9", "4:3", "填充", "原始", "裁剪")));
         items.add(new ArrayList<>(Arrays.asList("系统", "ijk硬解", "ijk软解", "exo")));
         items.add(new ArrayList<>(Arrays.asList("5s", "10s", "15s", "20s", "25s", "30s")));
-        items.add(new ArrayList<>(Arrays.asList("显示时间", "显示网速", "换台反转", "跨选分类")));
+        items.add(new ArrayList<>(Arrays.asList("显示时间", "显示网速", "换台反转", "跨选分类", "换台预加载", "检查更新")));
 
         groups.clear();
         for (int i = 0; i < groupNames.size(); i++) {
@@ -105,6 +105,7 @@ final class LiveSettingPanel {
         groups.get(3).getLiveSettingItems().get(1).setItemSelected(LiveConfig.showNetSpeed());
         groups.get(3).getLiveSettingItems().get(2).setItemSelected(LiveConfig.channelReverse());
         groups.get(3).getLiveSettingItems().get(3).setItemSelected(LiveConfig.crossGroup());
+        groups.get(3).getLiveSettingItems().get(4).setItemSelected(LiveConfig.preloadEnabled());
         groupAdapter.setNewData(groups);
     }
 
@@ -166,6 +167,16 @@ final class LiveSettingPanel {
                         select = !LiveConfig.crossGroup();
                         LiveConfig.setCrossGroup(select);
                         break;
+                    case 4:
+                        select = !LiveConfig.preloadEnabled();
+                        LiveConfig.setPreloadEnabled(select);
+                        // 关掉要立刻放掉后台预加载实例;打开要马上补一次
+                        mHost.onPreloadSettingChanged();
+                        break;
+                    case 5:
+                        // 动作项:立即检查更新,不改选中态
+                        mHost.checkUpdate();
+                        return;
                 }
                 itemAdapter.selectItem(position, select, false);
                 mHost.refreshPreferenceUi(); // 显示时间/显示网速等即时作用于全屏与小窗控制条

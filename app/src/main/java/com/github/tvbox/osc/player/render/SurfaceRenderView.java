@@ -41,6 +41,11 @@ public class SurfaceRenderView extends SurfaceView implements IRenderView, Surfa
     @Override
     public void attachToPlayer(@NonNull AbstractPlayer player) {
         this.mMediaPlayer = player;
+        // 换台扶正换了播放器实例：Surface 已存在时立刻重新绑定，避免等下一次 surfaceChanged
+        SurfaceHolder holder = getHolder();
+        if (holder != null && holder.getSurface() != null && holder.getSurface().isValid()) {
+            player.setDisplay(holder);
+        }
     }
 
     @Override

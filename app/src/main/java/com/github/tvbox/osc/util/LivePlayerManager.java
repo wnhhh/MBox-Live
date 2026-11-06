@@ -16,6 +16,11 @@ import xyz.doikki.videoplayer.player.VideoView;
 public class LivePlayerManager {
     JSONObject defaultPlayerConfig = new JSONObject();
     JSONObject currentPlayerConfig;
+    /**
+     * 最近一次取配置是否改了内核/渲染方式：改了就必须销毁重建播放器，
+     * 既不能复用当前实例换源，也不能扶正预加载实例（它的内核可能对不上）。
+     */
+    private boolean rebuildRequired = false;
 
     public void init(VideoView videoView) {
         try {
@@ -27,10 +32,19 @@ public class LivePlayerManager {
             e.printStackTrace();
         }
         getDefaultLiveChannelPlayer(videoView);
+        rebuildRequired = false;   // 刚进页面还没开始播，下一次起播不需要"重建"
+    }
+
+    /** 取走"需要重建播放器"的标记（读一次即清零） */
+    public boolean consumeRebuildRequired() {
+        boolean v = rebuildRequired;
+        rebuildRequired = false;
+        return v;
     }
 
     public void getDefaultLiveChannelPlayer(VideoView videoView) {
         PlayerHelper.updateCfg(videoView, defaultPlayerConfig);
+        rebuildRequired = true;
         try {
             currentPlayerConfig = new JSONObject(defaultPlayerConfig.toString());
         } catch (JSONException e) {
@@ -55,6 +69,7 @@ public class LivePlayerManager {
                 videoView.setScreenScaleType(playerConfig.getInt("sc"));
             } else {
                 PlayerHelper.updateCfg(videoView, playerConfig);
+                rebuildRequired = true;
             }
         } catch (JSONException e) {
             e.printStackTrace();

@@ -10,6 +10,7 @@ import android.graphics.Color;
 import android.net.Uri;
 import android.os.Build;
 import android.os.Parcelable;
+import android.os.SystemClock;
 import android.text.TextUtils;
 import android.util.AttributeSet;
 import android.view.Gravity;
@@ -121,6 +122,37 @@ public class VideoView<P extends AbstractPlayer> extends FrameLayout
      * 循环播放
      */
     protected boolean mIsLooping;
+
+    // ------------------------------------------------------------------
+    // 换台预加载（抖音式秒切）：另起一个静音实例，把相邻频道的「建连 + 解封装 + 首包」提前做完，
+    // 换台时直接扶正（复用已有 Surface，不重建播放器和渲染视图）。
+    // ------------------------------------------------------------------
+
+    /** 预加载实例（无画面、静音），扶正后成为主播放器 */
+    protected P mPreloadPlayer;
+    /** 预加载地址 */
+    protected String mPreloadUrl;
+    /** 预加载地址的请求头 */
+    protected Map<String, String> mPreloadHeaders;
+    /** 预加载是否已 prepare 完成 */
+    protected boolean mPreloadPrepared;
+    /** 预加载开始时刻（SystemClock.elapsedRealtime） */
+    protected long mPreloadStartAt;
+    /** 预加载实例解析到的视频宽高（扶正后直接套用，省一次 onVideoSizeChanged） */
+    protected final int[] mPreloadVideoSize = {0, 0};
+    /** 预加载有效期：超过这个时长认为连接/缓冲已不可靠，换台时不再扶正（直播流尤其需要） */
+    public static final long PRELOAD_TTL_MS = 90 * 1000L;
+
+    @Nullable
+    protected OnPreloadListener mOnPreloadListener;
+
+    /** 预加载回调：上层用于打点、失败退避 */
+    public interface OnPreloadListener {
+
+        void onPreloadReady(String url);
+
+        void onPreloadFailed(String url);
+    }
 
     /**
      * {@link #mPlayerContainer}背景色，默认黑色
@@ -361,6 +393,8 @@ public class VideoView<P extends AbstractPlayer> extends FrameLayout
      * 释放播放器
      */
     public void release() {
+        // 预加载实例一并释放，避免换页/退出后还留一个后台实例占解码器和连接
+        cancelPreload();
         if (!isInIdleState()) {
             //释放播放器
             if (mMediaPlayer != null) {
@@ -394,6 +428,226 @@ public class VideoView<P extends AbstractPlayer> extends FrameLayout
             mCurrentPosition = 0;
             //切换转态
             setPlayState(STATE_IDLE);
+        }
+    }
+
+    // ------------------------------------------------------------------
+    // 换台预加载
+    // ------------------------------------------------------------------
+
+    public void setOnPreloadListener(@Nullable OnPreloadListener listener) {
+        this.mOnPreloadListener = listener;
+    }
+
+    /**
+     * 预加载一个地址：另起一个播放器实例，静音、不挂画面，只把「建连 + 解封装 + 首包」做完。
+     * <p>
+     * 不做 start()：预加载实例不解码、不出声（软解下同时跑两路 1080p 解码会把 CPU 吃满），
+     * 换台时用 {@link #promotePreloaded()} 扶正后再 start()，省掉的是冷启动最贵的建连和探测。
+     * <p>
+     * 幂等：同一地址已在预加载且未过期时直接返回 true，可放心反复调用。
+     *
+     * @return true 表示预加载已发起（或已在预加载）；false 表示不适用于该地址
+     */
+    public synchronized boolean preload(String url, Map<String, String> headers) {
+        if (TextUtils.isEmpty(url)) return false;
+        // 正在播这个台就不用预加载了
+        if (mMediaPlayer != null && url.equals(mUrl) && isInPlaybackState()) return false;
+        if (mPreloadPlayer != null && url.equals(mPreloadUrl) && isPreloadUsable()) return true;
+
+        cancelPreload();
+        P player = null;
+        try {
+            player = mPlayerFactory.createPlayer(getContext());
+            player.setPlayerEventListener(new PreloadPlayerEvent(url));
+            player.initPlayer();
+            player.setVolume(0f, 0f);          // 预加载实例必须静音，否则会和正在播的台串音
+
+            mPreloadPlayer = player;
+            mPreloadUrl = url;
+            mPreloadHeaders = headers;
+            mPreloadPrepared = false;
+            mPreloadStartAt = SystemClock.elapsedRealtime();
+            mPreloadVideoSize[0] = 0;
+            mPreloadVideoSize[1] = 0;
+
+            player.setDataSource(url, headers);
+            player.prepareAsync();
+            return true;
+        } catch (Throwable th) {
+            L.e("preload 失败: " + th.getMessage());
+            if (mPreloadPlayer == player) {
+                cancelPreload();
+            }
+            return false;
+        }
+    }
+
+    /** 取消预加载并释放实例（页面退到后台/退出时必须调，否则会留一路后台连接） */
+    public synchronized void cancelPreload() {
+        P player = mPreloadPlayer;
+        mPreloadPlayer = null;
+        mPreloadUrl = null;
+        mPreloadHeaders = null;
+        mPreloadPrepared = false;
+        mPreloadStartAt = 0L;
+        if (player != null) {
+            try {
+                player.setPlayerEventListener(null);
+                player.release();
+            } catch (Throwable ignored) {
+            }
+        }
+    }
+
+    /** 预加载是否可用于扶正（已 prepare 完成且未过期） */
+    public synchronized boolean isPreloadUsable() {
+        return mPreloadPlayer != null && mPreloadPrepared && getPreloadAgeMs() < PRELOAD_TTL_MS;
+    }
+
+    /** 当前预加载的地址（没有则为 null） */
+    @Nullable
+    public synchronized String getPreloadedUrl() {
+        return mPreloadUrl;
+    }
+
+    /** 预加载已等待时长（毫秒）；没有预加载时返回 Long.MAX_VALUE */
+    public synchronized long getPreloadAgeMs() {
+        return mPreloadStartAt <= 0 ? Long.MAX_VALUE : SystemClock.elapsedRealtime() - mPreloadStartAt;
+    }
+
+    /**
+     * 把预加载实例扶正为当前播放器：不重建播放器、不重建渲染视图，直接换内核实例并复用已有 Surface。
+     * 调用成功后仍需调 {@link #start()} 才会出画面。
+     *
+     * @return true 表示已扶正；false 表示没有可用的预加载（调用方应走普通起播）
+     */
+    public synchronized boolean promotePreloaded() {
+        if (!isPreloadUsable()) return false;
+
+        P promoted = mPreloadPlayer;
+        String url = mPreloadUrl;
+        Map<String, String> headers = mPreloadHeaders;
+        mPreloadPlayer = null;
+        mPreloadUrl = null;
+        mPreloadHeaders = null;
+        mPreloadPrepared = false;
+        mPreloadStartAt = 0L;
+
+        // 旧实例只释放播放器，保留渲染视图：Surface 不动，切台时不会闪一下黑屏
+        if (mMediaPlayer != null) {
+            try {
+                mMediaPlayer.setPlayerEventListener(null);
+                mMediaPlayer.release();
+            } catch (Throwable ignored) {
+            }
+            mMediaPlayer = null;
+        }
+
+        mUrl = url;
+        mHeaders = headers;
+        mMediaPlayer = promoted;
+        mMediaPlayer.setPlayerEventListener(this);
+        mCurrentPosition = 0;
+
+        if (mRenderView == null) {
+            addDisplay();
+        } else {
+            // 关键：把预加载实例挂到现成的 Surface 上，第一帧几乎立刻就能画出来
+            mRenderView.attachToPlayer(mMediaPlayer);
+        }
+        setOptions();
+        // 预加载阶段解析到的宽高直接套用:否则换台后画面比例要等下一次回调才正确
+        if (mPreloadVideoSize[0] > 0 && mPreloadVideoSize[1] > 0) {
+            onVideoSizeChanged(mPreloadVideoSize[0], mPreloadVideoSize[1]);
+            mPreloadVideoSize[0] = 0;
+            mPreloadVideoSize[1] = 0;
+        }
+        if (mEnableAudioFocus && mAudioFocusHelper == null) {
+            mAudioFocusHelper = new AudioFocusHelper(this);
+        }
+        setPlayState(STATE_PREPARED);
+        return true;
+    }
+
+    /** 地址命中预加载时扶正，不命中返回 false（调用方走普通起播） */
+    public synchronized boolean promotePreloadedIfMatches(String url) {
+        if (TextUtils.isEmpty(url) || !url.equals(mPreloadUrl)) return false;
+        return promotePreloaded();
+    }
+
+    /**
+     * 快速换源：复用当前播放器实例与渲染 Surface，只 reset + 换地址 + prepareAsync。
+     * <p>
+     * 相比 {@code release() + setUrl() + start()}，省掉播放器实例重建和 TextureView 重建
+     * （这两步在换台卡顿里占比很高），画面还会保留上一帧直到新流出画，不会中间黑一下。
+     *
+     * @return false 表示当前没有可复用的实例（调用方应回退到 release() + setUrl() + start()）
+     */
+    public boolean switchUrl(String url, Map<String, String> headers) {
+        if (TextUtils.isEmpty(url) || mMediaPlayer == null || isInIdleState()) return false;
+        mUrl = url;
+        mHeaders = headers;
+        try {
+            if (mRenderView == null) addDisplay();
+            mMediaPlayer.setPlayerEventListener(this);
+            startPrepare(true);
+            // reset() 会把内核的 Surface 解绑，这里把现成的 Surface 重新挂回去，
+            // 否则换台后只有声音没有画面（这是复用实例相对 release+重建 唯一要补的一步）
+            if (mRenderView != null) mRenderView.attachToPlayer(mMediaPlayer);
+            return true;
+        } catch (Throwable th) {
+            L.e("switchUrl 失败: " + th.getMessage());
+            return false;
+        }
+    }
+
+    /** 预加载实例的事件只用来标记「就绪 / 失败」，绝不参与主播放器的状态机 */
+    private final class PreloadPlayerEvent implements AbstractPlayer.PlayerEventListener {
+
+        private final String mEventUrl;
+
+        PreloadPlayerEvent(String url) {
+            mEventUrl = url;
+        }
+
+        @Override
+        public void onPrepared() {
+            post(new Runnable() {
+                @Override
+                public void run() {
+                    if (mPreloadPlayer == null || !mEventUrl.equals(mPreloadUrl)) return;
+                    mPreloadPrepared = true;
+                    if (mOnPreloadListener != null) mOnPreloadListener.onPreloadReady(mEventUrl);
+                }
+            });
+        }
+
+        @Override
+        public void onError() {
+            post(new Runnable() {
+                @Override
+                public void run() {
+                    if (mPreloadPlayer == null || !mEventUrl.equals(mPreloadUrl)) return;
+                    cancelPreload();
+                    if (mOnPreloadListener != null) mOnPreloadListener.onPreloadFailed(mEventUrl);
+                }
+            });
+        }
+
+        @Override
+        public void onCompletion() {
+        }
+
+        @Override
+        public void onInfo(int what, int extra) {
+        }
+
+        @Override
+        public void onVideoSizeChanged(int width, int height) {
+            // 预加载阶段记下来,扶正后一次性套用(否则画面比例要等新流的第一帧回调)
+            mPreloadVideoSize[0] = width;
+            mPreloadVideoSize[1] = height;
         }
     }
 

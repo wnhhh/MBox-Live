@@ -20,4 +20,10 @@ public interface LiveSettingHost {
 
     /** 偏好设置变化后即时刷新两套控制条的显示项 */
     void refreshPreferenceUi();
+
+    /** 换台预加载开关变化:关掉要立刻释放预加载实例,打开要马上补一次预加载 */
+    void onPreloadSettingChanged();
+
+    /** 手动"检查更新"(设置面板里的动作项,不参与选中态) */
+    void checkUpdate();
 }

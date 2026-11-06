@@ -158,4 +158,17 @@ public final class LiveConfig {
         PrefsDataStore.put(HawkConfig.LIVE_RELOAD_BTN_HIDDEN, hidden);
         com.github.tvbox.osc.log.LogStore.log(com.github.tvbox.osc.log.Category.SYSTEM, "直播设置: 刷新按钮隐藏=" + hidden);
     }
+
+    // ── 换台预加载 ──
+
+    /** 换台预加载(默认开):下一个台提前建连并解封装,换台时直接扶正实例 */
+    public static boolean preloadEnabled() {
+        return PrefsDataStore.getBoolean(HawkConfig.LIVE_PRELOAD, true);
+    }
+
+    public static void setPreloadEnabled(boolean on) {
+        if (preloadEnabled() == on) return;
+        PrefsDataStore.put(HawkConfig.LIVE_PRELOAD, on);
+        com.github.tvbox.osc.log.LogStore.log(com.github.tvbox.osc.log.Category.SYSTEM, "直播设置: 换台预加载=" + on);
+    }
 }

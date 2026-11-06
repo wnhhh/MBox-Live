@@ -34,6 +34,11 @@ public class TextureRenderView extends TextureView implements IRenderView, Textu
     @Override
     public void attachToPlayer(@NonNull AbstractPlayer player) {
         this.mMediaPlayer = player;
+        // 换台扶正会更换播放器实例但复用本视图：Surface 已经在了，立刻交给新实例，
+        // 否则要等下一次 surfaceCreated 才有画面（表现就是切台后卡一下黑屏）
+        if (mSurface != null) {
+            player.setSurface(mSurface);
+        }
     }
 
     @Override
