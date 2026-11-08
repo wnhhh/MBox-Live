@@ -121,10 +121,21 @@ jobs:
           echo "=== release notes (${PREV:-(no previous tag)} -> ${TAG}) ==="
           cat RELEASE_NOTES.md
 
+      # 资产名统一成纯 ASCII(MBox_<版本>.apk):gradle 产物名里带中文应用名("MBox直播"),
+      # 在 Linux runner 上会被替换成点,产出 MBox._v3.6.2_release_20261108.apk 这种难念的名字。
+      - name: Normalize APK asset name
+        if: startsWith(github.ref, 'refs/tags/v')
+        run: |
+          mkdir -p release-assets
+          for f in app/build/outputs/apk/release/*.apk; do
+            cp "$f" "release-assets/MBox_${GITHUB_REF_NAME#v}.apk"
+          done
+          ls -l release-assets
+
       - name: Create GitHub Release
         if: startsWith(github.ref, 'refs/tags/v')
         uses: softprops/action-gh-release@v2
         with:
           name: MBox ${{ github.ref_name }}
           body_path: RELEASE_NOTES.md
-          files: app/build/outputs/apk/release/*.apk
+          files: release-assets/*.apk
