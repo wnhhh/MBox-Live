@@ -208,24 +208,26 @@
 				/>
 		</LinearLayout>
 	</LinearLayout>
-<!--添加EPG显示，更改样式 by 龍-->
+	</LinearLayout>
 
+<!--换台信息浮层(台号+台名+线路):必须是根 FrameLayout 的直接子视图,叠在画面上。
+    之前放在 live_root(垂直 LinearLayout)里,列表用 weight=1 把剩余高度吃光,
+    这个控件会被挤到屏幕外;而且代码给它设置的是 FrameLayout 参数,父容器是
+    LinearLayout 时会在 measure 阶段 ClassCastException 闪退。 -->
     <TextView
         android:id="@+id/tvChannel"
         android:layout_width="wrap_content"
         android:layout_height="wrap_content"
-        android:layout_gravity="right"
+        android:layout_gravity="top|end"
         android:layout_marginTop="30dp"
-        android:layout_marginRight="60dp"
+        android:layout_marginEnd="60dp"
         android:background="@drawable/shape_live_channel_num"
         android:gravity="center"
         android:paddingTop="5dp"
         android:paddingBottom="5dp"
-        android:textSize="36dp"
+        android:textSize="24sp"
         android:textStyle="bold"
         android:visibility="gone" />
-
-	</LinearLayout>
 
 	<!-- 刷新直播源:单击=重新拉取频道表并续播当前频道;长按=隐藏(原地留小圆点,单击圆点即可恢复) -->
 	<ImageView

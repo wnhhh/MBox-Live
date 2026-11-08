@@ -5,12 +5,10 @@ import android.os.Handler;
 import android.os.SystemClock;
 import android.text.TextUtils;
 import android.util.Base64;
-import android.view.Gravity;
 import android.view.KeyEvent;
 import android.view.MotionEvent;
 import android.view.View;
 import android.view.View.OnClickListener;
-import android.widget.FrameLayout;
 import android.widget.ImageView;
 import android.widget.LinearLayout;
 import android.widget.TextView;
@@ -590,16 +588,14 @@ public class LiveActivity extends BaseActivity implements LiveLineSelectHost, Li
     }
 
     private void showChannelInfo() {
+        if (currentLiveChannelItem == null || tvChannelInfo == null) return;
         tvChannelInfo.setText(String.format(Locale.getDefault(), "%d %s %s(%d/%d)", currentLiveChannelItem.getChannelNum(),
                 currentLiveChannelItem.getChannelName(), currentLiveChannelItem.getSourceName(),
                 currentLiveChannelItem.getSourceIndex() + 1, currentLiveChannelItem.getSourceNum()));
 
-        FrameLayout.LayoutParams lParams = new FrameLayout.LayoutParams(LinearLayout.LayoutParams.WRAP_CONTENT, LinearLayout.LayoutParams.WRAP_CONTENT);
-        lParams.gravity = Gravity.RIGHT;
-        lParams.rightMargin = 60;
-        lParams.topMargin = 30;
-        tvChannelInfo.setLayoutParams(lParams);
-
+        // 位置与边距交给布局文件(layout_gravity / layout_marginEnd)。
+        // 这里曾硬编码 FrameLayout.LayoutParams 塞给这个控件,而它当时挂在 LinearLayout 下,
+        // 结果是 measure 阶段 FrameLayout$LayoutParams cannot be cast to LinearLayout$LayoutParams 闪退。
         tvChannelInfo.setVisibility(View.VISIBLE);
         mHandler.removeCallbacks(mHideChannelInfoRun);
         mHandler.postDelayed(mHideChannelInfoRun, 3000);
