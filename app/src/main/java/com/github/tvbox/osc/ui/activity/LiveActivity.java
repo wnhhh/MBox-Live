@@ -671,6 +671,8 @@ public class LiveActivity extends BaseActivity implements LiveLineSelectHost, Li
             mVideoView.setUrl(url);
         }
         mVideoView.start();
+        // 换台后把"台号 + 台名 + 线路(x/y)"显示 3 秒,让用户确认切到了哪个台
+        if (currentLiveChannelItem != null) showChannelInfo();
         return true;
     }
 
@@ -817,6 +819,11 @@ public class LiveActivity extends BaseActivity implements LiveLineSelectHost, Li
             @Override
             public void changeChannel(int direction) {
                 zapByGesture(direction);
+            }
+
+            @Override
+            public String previewChannelName(int direction) {
+                return getChannelNameByDirection(direction);
             }
         });
         controller.setCanChangePosition(false);
@@ -1283,6 +1290,23 @@ public class LiveActivity extends BaseActivity implements LiveLineSelectHost, Li
         lastZapDirection = direction;
         Integer[] groupChannelIndex = getNextChannel(direction, true);
         playChannel(groupChannelIndex[0], groupChannelIndex[1], false);
+    }
+
+    /**
+     * 取某个方向上相邻台的台名,供手势拖动时预览。
+     * 取下一个台的口径必须与 {@link #zapChannel(int)} 一致(强制跨组),
+     * 否则预览显示的台和真正切过去的台会对不上。
+     */
+    private String getChannelNameByDirection(int direction) {
+        try {
+            Integer[] idx = getNextChannel(direction, true);
+            if (idx == null || idx[0] == null || idx[1] == null) return null;
+            ArrayList<LiveChannelItem> channels = getLiveChannels(idx[0]);
+            if (idx[1] < 0 || idx[1] >= channels.size()) return null;
+            return channels.get(idx[1]).getChannelName();
+        } catch (Throwable th) {
+            return null;
+        }
     }
 
     /** 手势换台统一入口:页面级与控制器共用,350ms 防抖保证一次滑动只切一个台 */

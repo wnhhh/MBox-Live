@@ -278,6 +278,28 @@ public abstract class BaseController extends BaseVideoController implements Gest
     }
 
     /**
+     * 手势提示浮层(亮度/音量/换台预览共用同一个 HUD),1 秒后自动消失。
+     * 拖动过程中反复调用只会刷新计时,不会叠出多个浮层。
+     */
+    protected void showSlideTip(String text) {
+        if (mHandler == null) return;
+        Message msg = Message.obtain();
+        msg.what = 100;
+        msg.obj = text;
+        mHandler.sendMessage(msg);
+        mHandler.removeMessages(101);
+        mHandler.sendEmptyMessageDelayed(101, 1000);
+    }
+
+    /** 立即关闭提示浮层(松手/手势取消时用,别让上一段的提示挂着) */
+    protected void hideSlideTip() {
+        if (mHandler == null) return;
+        mHandler.removeMessages(100);
+        mHandler.removeMessages(101);
+        mHandler.sendEmptyMessage(101);
+    }
+
+    /**
      * 中区竖向滑动(跟随手指持续回调),默认不处理。
      * 真正的动作应在 {@link #onCenterZoneSlideEnd(boolean, float)} 里结算,
      * 否则一次滑动会被拆成多次动作(直播会连跳好几个台)。
