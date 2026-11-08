@@ -40,6 +40,12 @@ public class AboutDialog extends AppBottomPopupView {
         final TextView tvStatus = findViewById(R.id.tv_update_status);
         final MaterialButton btn = findViewById(R.id.btn_check_update);
 
+        // 把当前版本直接摆在按钮上方:否则"检查更新"说"已是最新"时,用户无从判断自己到底装在哪个版本
+        TextView tvVersion = findViewById(R.id.tv_about_version);
+        if (tvVersion != null) {
+            tvVersion.setText("当前版本 v" + com.blankj.utilcode.util.AppUtils.getAppVersionName());
+        }
+
         btn.setOnClickListener(v -> {
             btn.setEnabled(false);
             showStatus(tvStatus, "正在检查更新...");
@@ -66,8 +72,10 @@ public class AboutDialog extends AppBottomPopupView {
 
                 @Override
                 public void onFailed(String message) {
-                    tvStatus.setVisibility(View.GONE);
                     btn.setEnabled(true);
+                    // 失败原因留在状态行,不要只弹一个转瞬即逝的 toast——
+                    // 否则网络不通时用户看到的是"点了没反应",无法判断是没更新还是查失败
+                    showStatus(tvStatus, message == null || message.isEmpty() ? "检查更新失败" : message);
                     AppBubble.toast(message);
                 }
             });

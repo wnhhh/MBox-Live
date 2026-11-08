@@ -10,6 +10,7 @@ import com.github.tvbox.osc.update.UpdateManager;
 import com.github.tvbox.osc.update.Updater;
 import com.github.tvbox.osc.update.UpdaterConfig;
 import com.github.tvbox.osc.update.UpdateInfo;
+import com.github.tvbox.osc.util.AppLog;
 import com.github.tvbox.osc.util.HeavyTaskUtil;
 
 import org.json.JSONArray;
@@ -65,24 +66,13 @@ public class GithubReleaseUpdater implements Updater {
             String err = null;
             try {
                 String current = AppUtils.getAppVersionName();
-                okhttp3.Response resp = null;
-                try {
-                    OkHttpClient client = AppCompositionRoot.network().general();
-                    Request req = new Request.Builder()
-                            .url(api)
-                            .header("Accept", "application/vnd.github.v3+json")
-                            .build();
-                    resp = client.newCall(req).execute();
-                    if (!resp.isSuccessful() || resp.body() == null) {
-                        err = "检查更新失败: HTTP " + resp.code();
-                    } else {
-                        info = parseReleases(resp.body().string(), current);
-                    }
-                } finally {
-                    if (resp != null) resp.close();
-                }
+                String json = fetchReleasesJson(api);
+                info = parseReleases(json, current);
+                AppLog.log("更新", "检查完成: 本地=" + current
+                        + " 结果=" + (info == null ? "已是最新" : "发现 v" + info.versionName));
             } catch (Throwable t) {
                 err = "检查更新失败: " + (t.getMessage() == null ? t.getClass().getSimpleName() : t.getMessage());
+                AppLog.log("更新", err);
             }
             final UpdateInfo fi = info;
             final String fe = err;
@@ -91,6 +81,55 @@ public class GithubReleaseUpdater implements Updater {
                 else cb.onCheckResult(fi);
             });
         });
+    }
+
+    /**
+     * 取 release 列表 JSON:直连 api.github.com 在国内经常被重置/超时,
+     * 直连失败后按已在用的下载加速前缀(UpdaterConfig#getGithubDownloadProxy)再试一次,
+     * 两条通道都失败才把两边的失败原因一起报出来(便于判断是网络还是仓库配置问题)。
+     * <p>
+     * 单次请求封顶 8s:检查更新是用户点了要等结果的动作,不能两条通道各卡 10s。
+     */
+    private static String fetchReleasesJson(String api) throws Exception {
+        String directError;
+        try {
+            return requestJson(api);
+        } catch (Exception e) {
+            directError = e.getMessage();
+        }
+        String proxy = UpdaterConfig.getGithubDownloadProxy();
+        if (proxy.isEmpty()) throw new Exception("直连失败(" + directError + ")");
+        String prefix = proxy.endsWith("/") ? proxy : proxy + "/";
+        try {
+            return requestJson(prefix + api);
+        } catch (Exception e) {
+            throw new Exception("直连失败(" + directError + "),加速通道失败(" + e.getMessage() + ")");
+        }
+    }
+
+    private static String requestJson(String url) throws Exception {
+        okhttp3.Response resp = null;
+        try {
+            // 复用全局客户端(连接池/DNS/UA 策略一致),仅为本请求收紧总时长
+            OkHttpClient client = AppCompositionRoot.network().general()
+                    .newBuilder()
+                    .callTimeout(8, java.util.concurrent.TimeUnit.SECONDS)
+                    .build();
+            Request req = new Request.Builder()
+                    .url(url)
+                    .header("Accept", "application/vnd.github.v3+json")
+                    .build();
+            resp = client.newCall(req).execute();
+            if (!resp.isSuccessful() || resp.body() == null) {
+                int code = resp.code();
+                if (code == 403) throw new Exception("GitHub 接口限流(403),请稍后再试");
+                if (code == 404) throw new Exception("仓库不存在或未公开发布(404)");
+                throw new Exception("HTTP " + code);
+            }
+            return resp.body().string();
+        } finally {
+            if (resp != null) resp.close();
+        }
     }
 
     /**
