@@ -153,6 +153,14 @@ public class LiveActivity extends BaseActivity implements LiveLineSelectHost, Li
     private static final long PRELOAD_FAIL_BACKOFF_MS = 5 * 60 * 1000L;
     /** 上次换台方向(+1 下一个台 / -1 上一个台):决定预加载哪一侧 */
     private int lastZapDirection = 1;
+    /** 连续自动跳过几个"无可用线路"的频道就停下:整张表都没信号时不能一直换下去 */
+    private static final int MAX_AUTO_SKIP = 5;
+    /** "无可用线路"的判定有效期:过期后允许再试一次(源可能已经恢复) */
+    private static final long DEAD_CHANNEL_TTL_MS = 5 * 60 * 1000L;
+    /** 已判定无可用线路的频道(组/频道名 → 判定时刻),换台时直接跳过,不必再等一轮超时 */
+    private final java.util.Map<String, Long> deadChannels = new java.util.HashMap<>();
+    /** 本轮连续自动跳过的次数:一旦播成功就清零 */
+    private int autoSkipCount = 0;
     private String preloadFailUrl = null;
     private long preloadFailAt = 0L;
     /** 是否已挂着一个待执行的预加载任务(避免频繁的 buffer 回调把定时器一直往后推) */
@@ -488,7 +496,7 @@ public class LiveActivity extends BaseActivity implements LiveLineSelectHost, Li
             int state = mVideoView.getCurrentPlayState();
             if (state == VideoView.STATE_PREPARING || state == VideoView.STATE_BUFFERING
                     || state == VideoView.STATE_PREPARED) {
-                schedulePlaybackRetry((LiveConfig.connectTimeout() + 1) * 5000L);
+                schedulePlaybackRetry(retryDelayMs());
             } else if (state == VideoView.STATE_ERROR || state == VideoView.STATE_PLAYBACK_COMPLETED) {
                 schedulePlaybackRetry(2000L);
             }
@@ -781,6 +789,7 @@ public class LiveActivity extends BaseActivity implements LiveLineSelectHost, Li
                         break;
                     case VideoView.STATE_PLAYING:
                         playbackRetry.onPlaying();
+                        autoSkipCount = 0;   // 播成功:自动跳过的连续计数清零
                         cancelPlaybackRetry();
                         schedulePreloadNeighbor(PRELOAD_DELAY_MS);
                         scheduleUpdateCheck();
@@ -802,7 +811,7 @@ public class LiveActivity extends BaseActivity implements LiveLineSelectHost, Li
                         mHandler.removeCallbacks(mPreloadRun);
                         preloadScheduled = false;
                         if (playState == VideoView.STATE_BUFFERING) mVideoView.cancelPreload();
-                        schedulePlaybackRetry((LiveConfig.connectTimeout() + 1) * 5000L);
+                        schedulePlaybackRetry(retryDelayMs());
                         break;
                 }
             }
@@ -839,6 +848,19 @@ public class LiveActivity extends BaseActivity implements LiveLineSelectHost, Li
         connectTimeoutTask = null;
     }
 
+    /** 连续跳过坏台时的单台判死上限:比用户设置的"超时换源"更短,别让人一直等 */
+    private static final long AUTO_SKIP_RETRY_MS = 6000L;
+
+    /**
+     * 这一轮"等多久算这个台/这条线路挂了"。
+     * 正常按用户设置(超时换源:5~30 秒);一旦进入"连续跳过坏台"状态就压到 6 秒——
+     * 此时用户要的是赶紧跳到能看的台,不是在坏台上按设置死等。
+     */
+    private long retryDelayMs() {
+        long normal = (LiveConfig.connectTimeout() + 1) * 5000L;
+        return autoSkipCount > 0 ? Math.min(normal, AUTO_SKIP_RETRY_MS) : normal;
+    }
+
     private void schedulePlaybackRetry(long delayMs) {
         cancelPlaybackRetry();
         if (!pageActive || currentLiveChannelItem == null || mVideoView == null) return;
@@ -848,9 +870,9 @@ public class LiveActivity extends BaseActivity implements LiveLineSelectHost, Li
             if (!pageActive || !playbackRetry.isCurrent(request)
                     || currentLiveChannelItem == null || mVideoView == null) return;
             if (!playbackRetry.tryNextSource(currentLiveChannelItem.getSourceNum())) {
+                // 这个台所有线路都拉不起来:不要再让用户干等 + 手动切,直接跳到下一个台
                 playbackRetry.invalidate();
-                mVideoView.release();
-                AppBubble.toastLong("当前频道无可用线路,请手动切换频道");
+                onChannelExhausted();
                 return;
             }
             currentLiveChannelItem.nextSource();
@@ -858,6 +880,56 @@ public class LiveActivity extends BaseActivity implements LiveLineSelectHost, Li
             updateLineText();
         };
         mHandler.postDelayed(connectTimeoutTask, delayMs);
+    }
+
+    /**
+     * 当前频道所有线路都失败:自动跳到下一个频道。
+     * 之前这里是 release + "当前频道无可用线路"提示,用户要干等一轮超时(默认每条线路 10s)
+     * 再手动换台,体验很差;而且同一批坏台来回切时会反复等。
+     * 现在:记住这个台(5 分钟内直接跳过),按上次换台方向自动跳到下一个台;
+     * 连续跳过达到 {@link #MAX_AUTO_SKIP} 个仍不成功就停下并提示,避免整张表都没信号时空转。
+     */
+    private void onChannelExhausted() {
+        if (!pageActive || currentLiveChannelItem == null || mVideoView == null) return;
+        String name = currentLiveChannelItem.getChannelName();
+        markChannelDead(currentChannelGroupIndex, currentLiveChannelIndex);
+        int dir = lastZapDirection == 0 ? 1 : lastZapDirection;
+        // 连续跳太多次、或这个方向上剩下的都是刚判死的台:就停下,别无限空转
+        if (autoSkipCount >= MAX_AUTO_SKIP || resolveZapTarget(dir) == null) {
+            autoSkipCount = 0;
+            mVideoView.release();
+            AppBubble.toastLong("连续多个频道都没有可用线路,已停止自动跳过");
+            return;
+        }
+        autoSkipCount++;
+        AppBubble.toast("「" + name + "」无可用线路,已自动跳过");
+        zapChannel(dir);
+    }
+
+    /** 频道标识:组下标 + 台名(台名在组内唯一,跨组可能重名) */
+    private String channelKey(int groupIndex, int channelIndex) {
+        try {
+            return groupIndex + "/" + getLiveChannels(groupIndex).get(channelIndex).getChannelName();
+        } catch (Throwable th) {
+            return null;
+        }
+    }
+
+    private void markChannelDead(int groupIndex, int channelIndex) {
+        String key = channelKey(groupIndex, channelIndex);
+        if (key != null) deadChannels.put(key, SystemClock.elapsedRealtime());
+    }
+
+    private boolean isChannelDead(int groupIndex, int channelIndex) {
+        String key = channelKey(groupIndex, channelIndex);
+        if (key == null) return false;
+        Long at = deadChannels.get(key);
+        if (at == null) return false;
+        if (SystemClock.elapsedRealtime() - at > DEAD_CHANNEL_TTL_MS) {
+            deadChannels.remove(key);
+            return false;
+        }
+        return true;
     }
 
     private void initChannelGroupView() {
@@ -1095,7 +1167,7 @@ public class LiveActivity extends BaseActivity implements LiveLineSelectHost, Li
                 playbackRetry.begin(false);
                 int state = mVideoView == null ? VideoView.STATE_IDLE : mVideoView.getCurrentPlayState();
                 if (state == VideoView.STATE_PREPARING || state == VideoView.STATE_BUFFERING || state == VideoView.STATE_PREPARED) {
-                    schedulePlaybackRetry((LiveConfig.connectTimeout() + 1) * 5000L);
+                    schedulePlaybackRetry(retryDelayMs());
                 } else if (state == VideoView.STATE_ERROR || state == VideoView.STATE_PLAYBACK_COMPLETED) {
                     schedulePlaybackRetry(2000L);
                 }
@@ -1288,8 +1360,38 @@ public class LiveActivity extends BaseActivity implements LiveLineSelectHost, Li
     private void zapChannel(int direction) {
         if (!isCurrentLiveChannelValid()) return;
         lastZapDirection = direction;
-        Integer[] groupChannelIndex = getNextChannel(direction, true);
-        playChannel(groupChannelIndex[0], groupChannelIndex[1], false);
+        Integer[] idx = resolveZapTarget(direction);
+        if (idx == null) return;   // 这个方向上全是刚判死的台:不做无谓起播(调用方会提示)
+        playChannel(idx[0], idx[1], false);
+    }
+
+    /**
+     * 找换台目标:顺带跳过"刚判定无可用线路"的台。
+     *
+     * @return 目标下标;返回 null 表示这个方向跳过若干坏台后仍无可试目标
+     */
+    private Integer[] resolveZapTarget(int direction) {
+        Integer[] idx = getNextChannel(direction, true);
+        for (int i = 0; i < MAX_AUTO_SKIP; i++) {
+            if (idx == null || idx[0] == null || idx[0] < 0 || idx[1] == null || idx[1] < 0) return idx;
+            if (!isChannelDead(idx[0], idx[1])) return idx;
+            Integer[] next = getNextChannelFrom(idx[0], idx[1], direction, true);
+            if (next[0] == null || next[0] < 0) return null;   // 跳到头都是坏台
+            idx = next;
+        }
+        return null;
+    }
+
+    /** 从指定频道位置继续找上/下一个台({@link #getNextChannel(int, boolean)} 只能从"当前频道"起算) */
+    private Integer[] getNextChannelFrom(int groupIndex, int channelIndex, int direction, boolean crossGroup) {
+        int[] next = LiveChannelNav.next(direction,
+                liveChannelGroupList.size(),
+                g -> getLiveChannels(g).size(),
+                g -> !liveChannelGroupList.get(g).getGroupPassword().isEmpty(),
+                groupIndex,
+                channelIndex,
+                crossGroup);
+        return new Integer[]{next[0], next[1]};
     }
 
     /**
@@ -1314,6 +1416,8 @@ public class LiveActivity extends BaseActivity implements LiveLineSelectHost, Li
         long now = SystemClock.elapsedRealtime();
         if (now - lastFlingSwitchAt < 350L) return;
         lastFlingSwitchAt = now;
+        // 用户主动换台:自动跳过的连续计数重新开始
+        autoSkipCount = 0;
         zapChannel(direction);
     }
 
