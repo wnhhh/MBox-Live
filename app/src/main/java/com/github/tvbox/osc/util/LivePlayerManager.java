@@ -43,7 +43,7 @@ public class LivePlayerManager {
     }
 
     public void getDefaultLiveChannelPlayer(VideoView videoView) {
-        PlayerHelper.updateCfg(videoView, defaultPlayerConfig);
+        PlayerHelper.updateCfg(videoView, defaultPlayerConfig, true);
         rebuildRequired = true;
         try {
             currentPlayerConfig = new JSONObject(defaultPlayerConfig.toString());
@@ -68,7 +68,7 @@ public class LivePlayerManager {
                     && playerConfig.getString("ijk").equals(currentPlayerConfig.getString("ijk"))) {
                 videoView.setScreenScaleType(playerConfig.getInt("sc"));
             } else {
-                PlayerHelper.updateCfg(videoView, playerConfig);
+                PlayerHelper.updateCfg(videoView, playerConfig, true);
                 rebuildRequired = true;
             }
         } catch (JSONException e) {
@@ -106,7 +106,7 @@ public class LivePlayerManager {
         } catch (JSONException e) {
             e.printStackTrace();
         }
-        PlayerHelper.updateCfg(videoView, playerConfig);
+        PlayerHelper.updateCfg(videoView, playerConfig, true);
 
         if (playerConfig.toString().equals(defaultPlayerConfig.toString()))
             LiveConfig.deleteChannelPlayerConfig(channelName);

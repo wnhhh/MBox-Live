@@ -30,6 +30,14 @@ import xyz.doikki.videoplayer.render.TextureRenderViewFactory;
 
 public class PlayerHelper {
     public static void updateCfg(VideoView videoView, JSONObject playerCfg) {
+        updateCfg(videoView, playerCfg, false);
+    }
+
+    /**
+     * @param liveStream 是否直播场景:直播走更激进的 IJK 起播探测(换台出画面更快),
+     *                   点播必须传 false(保持 ffmpeg 默认,不干扰分轨/多音轨识别)
+     */
+    public static void updateCfg(VideoView videoView, JSONObject playerCfg, boolean liveStream) {
         if (videoView == null) return; // 防御:播放器视图未初始化时跳过
         int playerType = PlayConfig.getPlayType();
         int renderType = PlayConfig.getRenderType();
@@ -44,7 +52,7 @@ public class PlayerHelper {
             e.printStackTrace();
         }
         IJKCode codec = IjkCodecConfigProviders.get().getIJKCodec(ijkCode);
-        PlayerFactory playerFactory = com.github.tvbox.osc.player.PlayerKernels.doikkiFactory(playerType, codec);
+        PlayerFactory playerFactory = com.github.tvbox.osc.player.PlayerKernels.doikkiFactory(playerType, codec, liveStream);
         if (playerType == 1) com.github.tvbox.osc.player.PlayerKernels.ensureIjkLibrariesLoaded();
         RenderViewFactory renderViewFactory = com.github.tvbox.osc.player.PlayerKernels.renderFactory(renderType);
         videoView.setPlayerFactory(playerFactory);

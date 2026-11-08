@@ -11,6 +11,7 @@ import com.github.tvbox.osc.util.MD5;
 
 import java.io.File;
 import java.util.LinkedHashMap;
+import java.util.Locale;
 import java.util.Map;
 
 import tv.danmaku.ijk.media.player.IMediaPlayer;
@@ -21,11 +22,22 @@ import xyz.doikki.videoplayer.ijk.IjkPlayer;
 
 public class IjkMediaPlayer extends IjkPlayer implements KernelTrackSupport {
 
+    /** 直播源起播探测:比 ffmpeg 默认(probesize 5MB / analyzeduration 5s)激进,换台出画面更快 */
+    private static final int LIVE_PROBESIZE_BYTES = 1024 * 1024;
+    private static final long LIVE_ANALYZE_DURATION_US = 1_000_000L;
+
     private IJKCode codec = null;
+    /** 本次内核实例是否用于直播(直播才启用激进起播探测,点播保持 ffmpeg 默认) */
+    private final boolean mLiveStream;
 
     public IjkMediaPlayer(Context context, IJKCode codec) {
+        this(context, codec, false);
+    }
+
+    public IjkMediaPlayer(Context context, IJKCode codec, boolean liveStream) {
         super(context);
         this.codec = codec;
+        this.mLiveStream = liveStream;
     }
 
     @Override
@@ -73,6 +85,14 @@ public class IjkMediaPlayer extends IjkPlayer implements KernelTrackSupport {
                 mMediaPlayer.setOption(tv.danmaku.ijk.media.player.IjkMediaPlayer.OPT_CATEGORY_FORMAT, "rtsp_flags", "prefer_tcp");
                 mMediaPlayer.setOption(tv.danmaku.ijk.media.player.IjkMediaPlayer.OPT_CATEGORY_FORMAT, "probesize", 512 * 1000);
                 mMediaPlayer.setOption(tv.danmaku.ijk.media.player.IjkMediaPlayer.OPT_CATEGORY_FORMAT, "analyzeduration", 2 * 1000 * 1000);
+            } else if (mLiveStream && isHttpLiveSource(path)) {
+                // HLS/FLV/TS 直播:ffmpeg 默认 probesize(5MB)+analyzeduration(5s) 要等够数据量才认为
+                // "prepared",直播里就表现为切台先黑屏转好几圈。直播先出画面比"探测充分"重要,
+                // 1MB/1s 仍足以识别音视频轨。若某类源起播异常(无声音/识别失败),把这两行去掉即回到默认。
+                mMediaPlayer.setOption(tv.danmaku.ijk.media.player.IjkMediaPlayer.OPT_CATEGORY_FORMAT, "probesize", LIVE_PROBESIZE_BYTES);
+                mMediaPlayer.setOption(tv.danmaku.ijk.media.player.IjkMediaPlayer.OPT_CATEGORY_FORMAT, "analyzeduration", LIVE_ANALYZE_DURATION_US);
+                // 起播阶段 CPU 跟不上时丢帧,而不是攒帧卡住(配合 setOptions 里已有的 framedrop=5)
+                mMediaPlayer.setOption(tv.danmaku.ijk.media.player.IjkMediaPlayer.OPT_CATEGORY_PLAYER, "framedrop", 5);
             } else if (!TextUtils.isEmpty(path)
                     && !path.contains(".m3u8")
                     && (path.contains(".mp4") || path.contains(".mkv") || path.contains(".avi"))) {
@@ -98,6 +118,18 @@ public class IjkMediaPlayer extends IjkPlayer implements KernelTrackSupport {
         setDataSourceHeader(headers);
         mMediaPlayer.setOption(tv.danmaku.ijk.media.player.IjkMediaPlayer.OPT_CATEGORY_FORMAT, "protocol_whitelist", "ijkio,ffio,async,cache,crypto,file,dash,http,https,ijkhttphook,ijkinject,ijklivehook,ijklongurl,ijksegment,ijktcphook,pipe,rtp,tcp,tls,udp,ijkurlhook,data");
         super.setDataSource(path, null);
+    }
+
+    /**
+     * 是否 HTTP(S) 直播串流(HLS / FLV / TS)。
+     * 项目实际直播源以 m3u8 为主(抽样占七成以上),FLV/TS 同样属于"边下边播"的直播形态;
+     * 这几种源才用激进的起播探测参数,点播(直链 mp4/mkv)保持 ffmpeg 默认,避免影响拖拽/分轨识别。
+     */
+    private static boolean isHttpLiveSource(String path) {
+        if (TextUtils.isEmpty(path)) return false;
+        String lower = path.toLowerCase(Locale.ROOT);
+        return lower.contains(".m3u8") || lower.contains(".m3u")
+                || lower.contains(".flv") || lower.contains(".ts");
     }
 
     private void setDataSourceHeader(Map<String, String> headers) {

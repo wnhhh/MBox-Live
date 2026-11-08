@@ -23,12 +23,21 @@ public final class PlayerKernels {
     /** doikki 内核工厂:1=IJK(带解码配置) 2=Exo 其它=系统 AndroidMediaPlayer;返回 null 表示未知类型 */
     @SuppressWarnings("rawtypes")
     public static PlayerFactory doikkiFactory(int playerType, IJKCode codec) {
+        return doikkiFactory(playerType, codec, false);
+    }
+
+    /**
+     * 同上,liveStream=true 表示本次内核用于直播(IJK 会启用更激进的起播探测,
+     * 换台出画面更快;点播必须传 false,别把点播的分轨/多音轨识别也改激进)。
+     */
+    @SuppressWarnings("rawtypes")
+    public static PlayerFactory doikkiFactory(int playerType, IJKCode codec, boolean liveStream) {
         switch (playerType) {
             case 1:
                 return new PlayerFactory<com.github.tvbox.osc.player.IjkMediaPlayer>() {
                     @Override
                     public com.github.tvbox.osc.player.IjkMediaPlayer createPlayer(Context context) {
-                        return new com.github.tvbox.osc.player.IjkMediaPlayer(context, codec);
+                        return new com.github.tvbox.osc.player.IjkMediaPlayer(context, codec, liveStream);
                     }
                 };
             case 2:
