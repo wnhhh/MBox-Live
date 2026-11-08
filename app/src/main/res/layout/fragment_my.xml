@@ -443,12 +443,24 @@
             </com.github.tvbox.osc.ui.kit.RubberBandScrollView>
         </LinearLayout>
 
+        <!-- 检查更新:直接放在「我的」页底部,不必再进「关于」弹窗找入口(TV 遥控可达) -->
+        <com.google.android.material.button.MaterialButton
+            android:id="@+id/btn_check_update"
+            style="@style/BtnGhost"
+            android:layout_width="wrap_content"
+            android:layout_height="40dp"
+            android:layout_gravity="center_horizontal"
+            android:layout_marginTop="8dp"
+            android:minWidth="132dp"
+            android:text="检查更新"
+            android:textSize="13sp" />
+
         <TextView
             android:id="@+id/tv_version"
             android:textSize="13sp"
             tools:text="v3.0.0"
             android:paddingVertical="5dp"
-            android:layout_marginTop="10dp"
+            android:layout_marginTop="2dp"
             android:layout_marginBottom="12dp"
             android:layout_gravity="center_horizontal"
             android:layout_width="wrap_content"

@@ -22,6 +22,8 @@ import com.github.tvbox.osc.ui.activity.SettingActivity;
 import com.github.tvbox.osc.ui.activity.SubscriptionActivity;
 import com.github.tvbox.osc.ui.dialog.AboutDialog;
 import com.github.tvbox.osc.ui.dialog.DialogCoordinator;
+import com.github.tvbox.osc.update.UpdateCheck;
+import com.github.tvbox.osc.update.UpdateInfo;
 import com.github.tvbox.osc.util.FastClickCheckUtil;
 import com.github.tvbox.osc.util.Utils;
 import com.hjq.permissions.OnPermissionCallback;
@@ -44,6 +46,9 @@ public class MyFragment extends BaseVbFragment<FragmentMyBinding> {
     @Override
     protected void init() {
         mBinding.tvVersion.setText("v"+ AppUtils.getAppVersionName());
+
+        // 「我的」页直接检查更新:不必先点「关于」再点弹窗里的按钮(TV 遥控少两步)
+        mBinding.btnCheckUpdate.setOnClickListener(v -> checkUpdate());
 
         mBinding.addrPlay.setOnClickListener(v ->{
             new XPopup.Builder(getContext())
@@ -80,6 +85,35 @@ public class MyFragment extends BaseVbFragment<FragmentMyBinding> {
 
         mBinding.llAbout.setOnClickListener(v -> {
             DialogCoordinator.center(mActivity, new AboutDialog(mActivity)).show();
+        });
+    }
+
+    /**
+     * 检查更新(「我的」页底部按钮):发现新版本直接弹更新说明,无更新/失败用气泡提示。
+     * 与「关于」弹窗、启动自动检查共用 {@link UpdateCheck},三处行为完全一致。
+     */
+    private void checkUpdate() {
+        FastClickCheckUtil.check(mBinding.btnCheckUpdate);
+        AppBubble.toast("正在检查更新...");
+        UpdateCheck.check(mActivity, new UpdateCheck.Listener() {
+            @Override
+            public void onChecking() {
+                // 点击时已经提示过,这里不再重复
+            }
+
+            @Override
+            public boolean onResult(UpdateInfo newVersion) {
+                if (newVersion == null) {
+                    AppBubble.toast("当前已是最新版本");
+                }
+                // 返回 false:有新版本时由 UpdateCheck 立刻弹更新说明(本页没有宿主弹窗要等退场)
+                return false;
+            }
+
+            @Override
+            public void onFailed(String message) {
+                AppBubble.toast(message);
+            }
         });
     }
 
