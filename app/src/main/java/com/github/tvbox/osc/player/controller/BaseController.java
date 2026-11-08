@@ -40,6 +40,10 @@ public abstract class BaseController extends BaseVideoController implements Gest
     private boolean mChangePosition;
     private boolean mChangeBrightness;
     private boolean mChangeVolume;
+    /** 本次手势落在中区(竖向滑动):由子类接管,默认不处理(点播保持原状) */
+    private boolean mChangeCenterZone;
+    /** 本次手势按下点的 Y:松手时用它结算中区竖滑的总位移 */
+    private float mDownY;
     private boolean mCanChangePosition = true;
     private boolean mEnableInNormal;
     private boolean mCanSlide;
@@ -264,9 +268,50 @@ public abstract class BaseController extends BaseVideoController implements Gest
                 && mCurPlayState != VideoView.STATE_PLAYBACK_COMPLETED;
     }
 
+    /**
+     * 手势是否可用。默认只在播放中可用;
+     * 直播这类"换台本身就是打断当前加载"的场景由子类放开——
+     * 否则切台后那段 PREPARING 转圈期间,整块滑动手势都会被拦掉,按了没反应。
+     */
+    protected boolean isGestureAvailable() {
+        return isInPlaybackState();
+    }
+
+    /**
+     * 中区竖向滑动(跟随手指持续回调),默认不处理。
+     * 真正的动作应在 {@link #onCenterZoneSlideEnd(boolean, float)} 里结算,
+     * 否则一次滑动会被拆成多次动作(直播会连跳好几个台)。
+     *
+     * @param deltaY 自按下起的竖向位移,向上为正、向下为负
+     */
+    protected void onCenterZoneSlide(MotionEvent e1, MotionEvent e2, float deltaY) {
+
+    }
+
+    /**
+     * 中区竖向滑动结束(手指抬起/手势取消),默认不处理。
+     *
+     * @param canceled    手势是否被取消
+     * @param totalDeltaY 自按下起的竖向总位移,向上为正、向下为负
+     */
+    protected void onCenterZoneSlideEnd(boolean canceled, float totalDeltaY) {
+
+    }
+
     @Override
     public boolean onTouch(View v, MotionEvent event) {
-        return mGestureDetector.onTouchEvent(event);
+        int action = event.getActionMasked();
+        boolean handled = mGestureDetector.onTouchEvent(event);
+        // 手势识别器会消费事件,View.onTouchEvent 收不到 ACTION_UP,
+        // 所以中区动作在这里结算(先让识别器跑完,避免与 onFling 抢事件)
+        if (action == MotionEvent.ACTION_UP || action == MotionEvent.ACTION_CANCEL) {
+            if (mChangeCenterZone) {
+                mChangeCenterZone = false;
+                // 用按下点到抬起点的总位移结算:快速一甩时最后一次 MOVE 的位移可能还没到阈值
+                onCenterZoneSlideEnd(action == MotionEvent.ACTION_CANCEL, mDownY - event.getY());
+            }
+        }
+        return handled;
     }
 
     /**
@@ -274,7 +319,7 @@ public abstract class BaseController extends BaseVideoController implements Gest
      */
     @Override
     public boolean onDown(MotionEvent e) {
-        if (!isInPlaybackState() //不处于播放状态
+        if (!isGestureAvailable() //手势可用(直播:加载中也要能用)
                 || !mIsGestureEnabled //关闭了手势
                 || PlayerUtils.isEdge(getContext(), e)) //处于屏幕边沿
             return true;
@@ -289,6 +334,8 @@ public abstract class BaseController extends BaseVideoController implements Gest
         mChangePosition = false;
         mChangeBrightness = false;
         mChangeVolume = false;
+        mChangeCenterZone = false;
+        mDownY = e.getY();
         return true;
     }
 
@@ -317,7 +364,7 @@ public abstract class BaseController extends BaseVideoController implements Gest
      */
     @Override
     public boolean onScroll(MotionEvent e1, MotionEvent e2, float distanceX, float distanceY) {
-        if (!isInPlaybackState() //不处于播放状态
+        if (!isGestureAvailable() //手势可用(直播:加载中也要能用)
                 || !mIsGestureEnabled //关闭了手势
                 || !mCanSlide //关闭了滑动手势
                 || isLocked() //锁住了屏幕
@@ -328,13 +375,15 @@ public abstract class BaseController extends BaseVideoController implements Gest
         if (mFirstTouch) {
             mChangePosition = Math.abs(distanceX) >= Math.abs(distanceY);
             if (!mChangePosition) {
-                // 竖向三等分:左 1/3 调亮度 / 中间 1/3 上下滑换台(在 onFling 里处理,拖动时不动) / 右 1/3 调音量
+                // 竖向三等分:左 1/3 调亮度 / 中间 1/3 交给子类(直播换台) / 右 1/3 调音量
                 int w = getWidth() > 0 ? getWidth() : PlayerUtils.getScreenWidth(getContext(), true);
                 float x = e1.getX();
                 if (x < w / 3f) {
                     mChangeBrightness = true;
                 } else if (x > w * 2f / 3f) {
                     mChangeVolume = true;
+                } else {
+                    mChangeCenterZone = true;
                 }
             }
 
@@ -343,7 +392,7 @@ public abstract class BaseController extends BaseVideoController implements Gest
                 mChangePosition = mCanChangePosition;
             }
 
-            if (mChangePosition || mChangeBrightness || mChangeVolume) {
+            if (mChangePosition || mChangeBrightness || mChangeVolume || mChangeCenterZone) {
                 for (Map.Entry<IControlComponent, Boolean> next : mControlComponents.entrySet()) {
                     IControlComponent component = next.getKey();
                     if (component instanceof IGestureComponent) {
@@ -359,6 +408,8 @@ public abstract class BaseController extends BaseVideoController implements Gest
             slideToChangeBrightness(deltaY);
         } else if (mChangeVolume) {
             slideToChangeVolume(deltaY);
+        } else if (mChangeCenterZone) {
+            onCenterZoneSlide(e1, e2, deltaY);
         }
         return true;
     }
