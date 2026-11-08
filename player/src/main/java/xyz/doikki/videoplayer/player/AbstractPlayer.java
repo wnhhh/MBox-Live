@@ -1,10 +1,17 @@
 package xyz.doikki.videoplayer.player;
 
 import android.content.res.AssetFileDescriptor;
+import android.os.Handler;
+import android.os.Looper;
+import android.util.Log;
 import android.view.Surface;
 import android.view.SurfaceHolder;
 
+import java.util.ArrayList;
+import java.util.List;
 import java.util.Map;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
 
 /**
  * 抽象的播放器，继承此接口扩展自己的播放器
@@ -36,6 +43,67 @@ public abstract class AbstractPlayer {
      * 播放器事件回调
      */
     protected PlayerEventListener mPlayerEventListener;
+    protected boolean mPreloadOnly;
+    protected boolean mPlayWhenPrepared = true;
+    protected final Handler mMainHandler = new Handler(Looper.getMainLooper());
+    private static final ExecutorService RELEASE_EXECUTOR = Executors.newSingleThreadExecutor();
+    private final List<Runnable> mReleaseCompletions = new ArrayList<>();
+    private boolean mReleaseStarted;
+    private boolean mReleaseComplete;
+
+    public void setPreloadOnly(boolean preloadOnly) {
+        mPreloadOnly = preloadOnly;
+    }
+
+    public void setPlayWhenPrepared(boolean playWhenPrepared) {
+        mPlayWhenPrepared = playWhenPrepared;
+    }
+
+    public boolean canReuseForSwitch() {
+        return true;
+    }
+
+    /** 主线程调用；completion 也在主线程执行。 */
+    public void release(Runnable completion) {
+        release();
+        if (completion != null) completion.run();
+    }
+
+    protected final boolean beginRelease(Runnable completion) {
+        if (mReleaseComplete) {
+            if (completion != null) mMainHandler.post(completion);
+            return false;
+        }
+        if (completion != null) mReleaseCompletions.add(completion);
+        if (mReleaseStarted) return false;
+        mReleaseStarted = true;
+        return true;
+    }
+
+    protected static void cleanupForRelease(Runnable cleanup) {
+        try {
+            cleanup.run();
+        } catch (RuntimeException e) {
+            Log.w("AbstractPlayer", "Player release cleanup failed", e);
+        }
+    }
+
+    protected final void releaseOnExecutor(Runnable release) {
+        RELEASE_EXECUTOR.execute(() -> {
+            try {
+                release.run();
+            } catch (RuntimeException e) {
+                Log.w("AbstractPlayer", "Player release failed", e);
+            } finally {
+                mMainHandler.post(() -> {
+                    mReleaseComplete = true;
+                    List<Runnable> completions = new ArrayList<>(mReleaseCompletions);
+                    mReleaseCompletions.clear();
+                    for (Runnable completion : completions) completion.run();
+                });
+            }
+        });
+    }
 
     /**
      * 初始化播放器实例

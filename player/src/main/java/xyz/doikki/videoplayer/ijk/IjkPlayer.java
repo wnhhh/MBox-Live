@@ -5,6 +5,7 @@ import android.content.Context;
 import android.content.res.AssetFileDescriptor;
 import android.net.Uri;
 import android.os.Bundle;
+import android.os.Looper;
 import android.text.TextUtils;
 import android.view.Surface;
 import android.view.SurfaceHolder;
@@ -26,6 +27,7 @@ public class IjkPlayer extends AbstractPlayer implements IMediaPlayer.OnErrorLis
     protected IjkMediaPlayer mMediaPlayer;
     private int mBufferedPercent;
     private final Context mAppContext;
+    private boolean mPrepared;
 
     public IjkPlayer(Context context) {
         mAppContext = context;
@@ -71,7 +73,7 @@ public class IjkPlayer extends AbstractPlayer implements IMediaPlayer.OnErrorLis
                 mMediaPlayer.setDataSource(mAppContext, uri, headers);
             }
         } catch (Exception e) {
-            mPlayerEventListener.onError();
+            if (mPlayerEventListener != null) mPlayerEventListener.onError();
         }
     }
 
@@ -80,25 +82,32 @@ public class IjkPlayer extends AbstractPlayer implements IMediaPlayer.OnErrorLis
         try {
             mMediaPlayer.setDataSource(new RawDataSourceProvider(fd));
         } catch (Exception e) {
-            mPlayerEventListener.onError();
+            if (mPlayerEventListener != null) mPlayerEventListener.onError();
         }
     }
 
     @Override
     public void pause() {
+        mPlayWhenPrepared = false;
+        if (mMediaPlayer == null || !mPrepared) return;
         try {
             mMediaPlayer.pause();
         } catch (IllegalStateException e) {
-            mPlayerEventListener.onError();
+            if (mPlayerEventListener != null) mPlayerEventListener.onError();
         }
     }
 
     @Override
     public void start() {
+        mPlayWhenPrepared = true;
+        if (mMediaPlayer == null || !mPrepared || mPreloadOnly) return;
         try {
             mMediaPlayer.start();
+            if (!isVideo() && mPlayerEventListener != null) {
+                mPlayerEventListener.onInfo(MEDIA_INFO_RENDERING_START, 0);
+            }
         } catch (IllegalStateException e) {
-            mPlayerEventListener.onError();
+            if (mPlayerEventListener != null) mPlayerEventListener.onError();
         }
     }
 
@@ -107,21 +116,31 @@ public class IjkPlayer extends AbstractPlayer implements IMediaPlayer.OnErrorLis
         try {
             mMediaPlayer.stop();
         } catch (IllegalStateException e) {
-            mPlayerEventListener.onError();
+            if (mPlayerEventListener != null) mPlayerEventListener.onError();
         }
     }
 
     @Override
     public void prepareAsync() {
         try {
+            mPrepared = false;
+            // 由 Java prepared 回调决定起播，避免 prepare 期间暂停后 native 仍自动 start。
+            mMediaPlayer.setOption(IjkMediaPlayer.OPT_CATEGORY_PLAYER, "start-on-prepared", 0);
             mMediaPlayer.prepareAsync();
         } catch (IllegalStateException e) {
-            mPlayerEventListener.onError();
+            if (mPlayerEventListener != null) mPlayerEventListener.onError();
         }
     }
 
     @Override
+    public boolean canReuseForSwitch() {
+        return false;
+    }
+
+    @Override
     public void reset() {
+        mPrepared = false;
+        mBufferedPercent = 0;
         mMediaPlayer.reset();
         mMediaPlayer.setOnVideoSizeChangedListener(this);
         setOptions();
@@ -137,28 +156,38 @@ public class IjkPlayer extends AbstractPlayer implements IMediaPlayer.OnErrorLis
         try {
             mMediaPlayer.seekTo((int) time);
         } catch (IllegalStateException e) {
-            mPlayerEventListener.onError();
+            if (mPlayerEventListener != null) mPlayerEventListener.onError();
         }
     }
 
     @Override
     public void release() {
-        mMediaPlayer.setOnErrorListener(null);
-        mMediaPlayer.setOnCompletionListener(null);
-        mMediaPlayer.setOnInfoListener(null);
-        mMediaPlayer.setOnBufferingUpdateListener(null);
-        mMediaPlayer.setOnPreparedListener(null);
-        mMediaPlayer.setOnVideoSizeChangedListener(null);
-        new Thread() {
-            @Override
-            public void run() {
-                try {
-                    mMediaPlayer.release();
-                } catch (Exception e) {
-                    e.printStackTrace();
-                }
-            }
-        }.start();
+        release(null);
+    }
+
+    @Override
+    public void release(Runnable completion) {
+        if (Looper.myLooper() != Looper.getMainLooper()) {
+            mMainHandler.post(() -> release(completion));
+            return;
+        }
+        if (!beginRelease(completion)) return;
+        final IjkMediaPlayer player = mMediaPlayer;
+        mMediaPlayer = null;
+        mPlayerEventListener = null;
+        mPrepared = false;
+        if (player != null) {
+            cleanupForRelease(() -> {
+                player.resetListeners();
+                player.setOnNativeInvokeListener(null);
+                player.setOnControlMessageListener(null);
+            });
+            cleanupForRelease(() -> player.setSurface(null));
+            cleanupForRelease(() -> player.setDisplay(null));
+        }
+        releaseOnExecutor(() -> {
+            if (player != null) player.release();
+        });
     }
 
     @Override
@@ -178,12 +207,12 @@ public class IjkPlayer extends AbstractPlayer implements IMediaPlayer.OnErrorLis
 
     @Override
     public void setSurface(Surface surface) {
-        mMediaPlayer.setSurface(surface);
+        if (mMediaPlayer != null) mMediaPlayer.setSurface(surface);
     }
 
     @Override
     public void setDisplay(SurfaceHolder holder) {
-        mMediaPlayer.setDisplay(holder);
+        if (mMediaPlayer != null) mMediaPlayer.setDisplay(holder);
     }
 
     @Override
@@ -213,32 +242,34 @@ public class IjkPlayer extends AbstractPlayer implements IMediaPlayer.OnErrorLis
 
     @Override
     public boolean onError(IMediaPlayer mp, int what, int extra) {
-        mPlayerEventListener.onError();
+        if (mp == mMediaPlayer && mPlayerEventListener != null) mPlayerEventListener.onError();
         return true;
     }
 
     @Override
     public void onCompletion(IMediaPlayer mp) {
-        mPlayerEventListener.onCompletion();
+        if (mp == mMediaPlayer && mPlayerEventListener != null) mPlayerEventListener.onCompletion();
     }
 
     @Override
     public boolean onInfo(IMediaPlayer mp, int what, int extra) {
-        mPlayerEventListener.onInfo(what, extra);
+        if (mp == mMediaPlayer && mPlayerEventListener != null) mPlayerEventListener.onInfo(what, extra);
         return true;
     }
 
     @Override
     public void onBufferingUpdate(IMediaPlayer mp, int percent) {
-        mBufferedPercent = percent;
+        if (mp == mMediaPlayer) mBufferedPercent = percent;
     }
 
     @Override
     public void onPrepared(IMediaPlayer mp) {
-        mPlayerEventListener.onPrepared();
-        // 修复播放纯音频时状态出错问题
-        if (!isVideo()) {
-            mPlayerEventListener.onInfo(AbstractPlayer.MEDIA_INFO_RENDERING_START, 0);
+        if (mp != mMediaPlayer || mPlayerEventListener == null) return;
+        mPrepared = true;
+        PlayerEventListener listener = mPlayerEventListener;
+        listener.onPrepared();
+        if (mp == mMediaPlayer && listener == mPlayerEventListener && !mPreloadOnly && mPlayWhenPrepared) {
+            start();
         }
     }
 
@@ -255,6 +286,7 @@ public class IjkPlayer extends AbstractPlayer implements IMediaPlayer.OnErrorLis
 
     @Override
     public void onVideoSizeChanged(IMediaPlayer mp, int width, int height, int sar_num, int sar_den) {
+        if (mp != mMediaPlayer || mPlayerEventListener == null) return;
         int videoWidth = mp.getVideoWidth();
         int videoHeight = mp.getVideoHeight();
         if (videoWidth != 0 && videoHeight != 0) {

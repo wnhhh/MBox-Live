@@ -4,7 +4,12 @@ import android.os.Handler;
 
 import com.github.tvbox.osc.util.AppLog;
 import com.google.gson.JsonArray;
+import com.google.gson.JsonParser;
 
+import java.io.File;
+import java.io.FileInputStream;
+import java.io.FileOutputStream;
+import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
 import java.util.LinkedHashMap;
 import java.util.concurrent.ExecutorService;
@@ -42,6 +47,42 @@ public final class LiveSourceParser {
     });
 
     private LiveSourceParser() {
+    }
+
+    public static void readCacheAsync(File file, Handler main, Callback callback) {
+        POOL.execute(() -> {
+            Result result = null;
+            long length = file.length();
+            if (length > 0 && length <= 8L * 1024 * 1024) {
+                try (FileInputStream input = new FileInputStream(file)) {
+                    byte[] bytes = new byte[(int) length];
+                    int offset = 0;
+                    while (offset < bytes.length) {
+                        int count = input.read(bytes, offset, bytes.length - offset);
+                        if (count < 0) break;
+                        offset += count;
+                    }
+                    if (offset == bytes.length) {
+                        JsonArray raw = JsonParser.parseString(new String(bytes, StandardCharsets.UTF_8)).getAsJsonArray();
+                        result = new Result(raw, LiveChannelGrouping.regroup(raw));
+                    }
+                } catch (Exception e) {
+                    AppLog.log("直播", "读频道缓存失败: " + e.getMessage());
+                }
+            }
+            final Result parsed = result;
+            main.post(() -> callback.onParsed(parsed));
+        });
+    }
+
+    public static void saveCacheAsync(File file, JsonArray raw) {
+        POOL.execute(() -> {
+            try (FileOutputStream output = new FileOutputStream(file)) {
+                output.write(raw.toString().getBytes(StandardCharsets.UTF_8));
+            } catch (Exception e) {
+                AppLog.log("直播", "写频道缓存失败: " + e.getMessage());
+            }
+        });
     }
 
     public static void parseAsync(final String content, final Handler main, final Callback callback) {

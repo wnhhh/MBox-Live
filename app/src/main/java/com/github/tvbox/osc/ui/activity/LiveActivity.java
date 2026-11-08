@@ -1,6 +1,5 @@
 package com.github.tvbox.osc.ui.activity;
 
-import android.content.Context;
 import android.net.Uri;
 import android.os.Handler;
 import android.os.SystemClock;
@@ -17,7 +16,6 @@ import android.widget.LinearLayout;
 import android.widget.TextView;
 import android.widget.Toast;
 
-import androidx.annotation.NonNull;
 import androidx.recyclerview.widget.RecyclerView;
 
 import com.blankj.utilcode.util.ConvertUtils;
@@ -58,19 +56,14 @@ import com.github.tvbox.osc.util.HCallBack;
 import com.github.tvbox.osc.util.AppLog;
 import com.github.tvbox.osc.util.HttpClient;
 import com.github.tvbox.osc.util.LiveConfig;
-import com.github.tvbox.osc.util.live.LiveChannelGrouping;
+import com.github.tvbox.osc.util.LivePlaybackRetry;
 import com.github.tvbox.osc.util.live.LiveSourceParser;
-import com.github.tvbox.osc.util.live.TxtSubscribe;
-import com.google.gson.JsonArray;
-import com.google.gson.JsonParser;
 import com.gyf.immersionbar.BarHide;
 import com.gyf.immersionbar.ImmersionBar;
 import com.lxj.xpopup.core.BasePopupView;
 import com.owen.tvrecyclerview.widget.V7LinearLayoutManager;
 
 import java.io.File;
-import java.io.FileInputStream;
-import java.io.FileOutputStream;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Date;
@@ -88,7 +81,6 @@ import xyz.doikki.videoplayer.player.VideoView;
  * @description:
  */
 public class LiveActivity extends BaseActivity implements LiveLineSelectHost, LiveSettingHost {
-    public static Context context;
     private VideoView mVideoView;
     private TextView tvChannelInfo;
     private LinearLayout tvLeftChannelListLayout;
@@ -97,18 +89,22 @@ public class LiveActivity extends BaseActivity implements LiveLineSelectHost, Li
     public LiveChannelGroupNewAdapter liveChannelGroupAdapter;
     public LiveChannelItemNewAdapter liveChannelItemAdapter;
 
-    public static  int currentChannelGroupIndex = 0;
-    private Handler mHandler = new Handler();
+    private int currentChannelGroupIndex = -1;
+    private final Handler mHandler = new Handler(android.os.Looper.getMainLooper());
+    private boolean pageActive = true;
+    private long sourceLoadGeneration;
+    private final Object liveSourceTag = new Object();
+    private final LivePlaybackRetry playbackRetry = new LivePlaybackRetry();
+    private Runnable connectTimeoutTask;
 
     private List<LiveChannelGroup> liveChannelGroupList = new ArrayList<>();
     private int currentLiveChannelIndex = -1;
-    private int currentLiveChangeSourceTimes = 0;
     private LiveChannelItem currentLiveChannelItem = null;
     private LivePlayerManager livePlayerManager = new LivePlayerManager();
     private ArrayList<Integer> channelGroupPasswordConfirmed = new ArrayList<>();
 
 //EPG   by 龍
-    private static LiveChannelItem  channel_Name = null;
+    private LiveChannelItem channel_Name = null;
     TextView tv_channelnum;
     TextView tip_chname;
 
@@ -174,6 +170,7 @@ public class LiveActivity extends BaseActivity implements LiveLineSelectHost, Li
     private final Runnable mPreloadRefreshRun = new Runnable() {
         @Override
         public void run() {
+            if (!pageActive || !LiveConfig.preloadEnabled()) return;
             preloadNeighborChannel();
             mHandler.postDelayed(this, PRELOAD_REFRESH_MS);
         }
@@ -199,7 +196,6 @@ public class LiveActivity extends BaseActivity implements LiveLineSelectHost, Li
                 .fitsSystemWindows(true)
                 .hideBar(BarHide.FLAG_HIDE_NAVIGATION_BAR)
                 .init();
-        context = this;
         epgStringAddress = LiveConfig.epgUrl();
         if(epgStringAddress == null || epgStringAddress.length()<5)
             epgStringAddress = "http://epg.51zmt.top:8000/api/diyp/";
@@ -347,52 +343,31 @@ public class LiveActivity extends BaseActivity implements LiveLineSelectHost, Li
         return new File(getFilesDir(), "live_cache_" + Integer.toHexString(url.hashCode()) + ".json");
     }
 
-    private void saveLivesCache(String url, String json) {
-        if (TextUtils.isEmpty(json)) return;
-        try {
-            FileOutputStream fos = new FileOutputStream(liveCacheFile(url));
-            try {
-                fos.write(json.getBytes("UTF-8"));
-            } finally {
-                fos.close();
-            }
-        } catch (Throwable th) {
-            AppLog.log("直播", "写频道缓存失败: " + th.getMessage());
-        }
-    }
-
-    /** 读缓存并灌进 provider;缓存不存在/损坏都返回 false(当作没命中,不影响正常拉取) */
-    private boolean loadLivesFromCache(String url) {
-        try {
-            File f = liveCacheFile(url);
-            long len = f.exists() ? f.length() : 0;
-            if (len <= 0 || len > 8L * 1024 * 1024) return false;   // 空文件/异常大文件都不认
-            byte[] buf = new byte[(int) len];
-            FileInputStream fis = new FileInputStream(f);
-            try {
-                int off = 0;
-                while (off < buf.length) {
-                    int n = fis.read(buf, off, buf.length - off);
-                    if (n <= 0) break;
-                    off += n;
+    private void loadLivesFromCache(String url) {
+        channelLoading = true;
+        final long request = ++sourceLoadGeneration;
+        LiveSourceParser.readCacheAsync(liveCacheFile(url), mHandler, result -> {
+            if (!isSourceLoadCurrent(request)) return;
+            channelLoading = false;
+            if (result != null && result.grouped != null && result.grouped.size() > 0) {
+                try {
+                    com.github.tvbox.osc.spiderapi.LiveChannelConfigProviders.get().loadLives(result.grouped);
+                    List<LiveChannelGroup> list = com.github.tvbox.osc.spiderapi.LiveChannelConfigProviders.get().getChannelGroupList();
+                    if (!list.isEmpty()) {
+                        liveChannelGroupList = new ArrayList<>(list);
+                        showSuccess();
+                        initLiveState();
+                        reloadFailCount = 0;
+                        scheduleNextAutoReload(1500L);
+                        return;
+                    }
+                } catch (Throwable th) {
+                    // 缓存能通过分组规整却缺 channels 等字段:应用失败别在主线程崩,回退联网重拉
+                    AppLog.log("直播", "应用频道缓存失败: " + th.getMessage());
                 }
-            } finally {
-                fis.close();
             }
-            JsonArray arr = JsonParser.parseString(new String(buf, "UTF-8")).getAsJsonArray();
-            if (arr == null || arr.size() == 0) return false;
-            // 缓存里存的是原始分组,这里同样过一遍分组规则(规则改了也能立刻生效)
-            com.github.tvbox.osc.spiderapi.LiveChannelConfigProviders.get().loadLives(
-                    LiveChannelGrouping.regroup(arr));
-            List<LiveChannelGroup> list = com.github.tvbox.osc.spiderapi.LiveChannelConfigProviders.get().getChannelGroupList();
-            if (list.isEmpty()) return false;
-            liveChannelGroupList.clear();
-            liveChannelGroupList.addAll(list);
-            return true;
-        } catch (Throwable th) {
-            AppLog.log("直播", "读频道缓存失败: " + th.getMessage());
-            return false;
-        }
+            loadLivesFromUrl(url, null, true);
+        });
     }
 
     /**
@@ -418,7 +393,7 @@ public class LiveActivity extends BaseActivity implements LiveLineSelectHost, Li
     /** 安排下一次自动刷新;delay 过小时(比如刚回前台已过期)按下限兜一下,避免连发 */
     private void scheduleNextAutoReload(long delayMs) {
         mHandler.removeCallbacks(mAutoReloadRun);
-        mHandler.postDelayed(mAutoReloadRun, Math.max(2000L, delayMs));
+        if (pageActive) mHandler.postDelayed(mAutoReloadRun, Math.max(2000L, delayMs));
     }
 
     //显示底部EPG
@@ -507,9 +482,18 @@ public class LiveActivity extends BaseActivity implements LiveLineSelectHost, Li
     @Override
     protected void onResume() {
         super.onResume();
+        pageActive = true;
         if (mVideoView != null) {
             mVideoView.resume();
+            int state = mVideoView.getCurrentPlayState();
+            if (state == VideoView.STATE_PREPARING || state == VideoView.STATE_BUFFERING
+                    || state == VideoView.STATE_PREPARED) {
+                schedulePlaybackRetry((LiveConfig.connectTimeout() + 1) * 5000L);
+            } else if (state == VideoView.STATE_ERROR || state == VideoView.STATE_PLAYBACK_COMPLETED) {
+                schedulePlaybackRetry(2000L);
+            }
         }
+        if (liveChannelGroupList.isEmpty() && !channelLoading) initLiveChannelList();
         // 回到前台:频道表放旧了就静默更新一次,否则把定时器按剩余时间重新挂上
         if (lastChannelLoadedAt > 0) {
             long age = SystemClock.elapsedRealtime() - lastChannelLoadedAt;
@@ -518,6 +502,9 @@ public class LiveActivity extends BaseActivity implements LiveLineSelectHost, Li
             } else {
                 scheduleNextAutoReload(AUTO_RELOAD_INTERVAL_MS - age);
             }
+        } else if (!liveChannelGroupList.isEmpty() && !channelLoading) {
+            // 缓存命中后还没成功联网就被切到后台:回前台补一次刷新,别让首刷永久丢失
+            scheduleNextAutoReload(2000L);
         }
 
         // 回到前台:恢复换台预加载(后台期间是停掉的)
@@ -544,10 +531,13 @@ public class LiveActivity extends BaseActivity implements LiveLineSelectHost, Li
 
     @Override
     protected void onPause() {
-        super.onPause();
-        // 后台不刷新:既省电省流量,也避免回来时列表和"正在播的台"对不上
+        pageActive = false;
+        sourceLoadGeneration++;
+        channelLoading = false;
+        HttpClient.cancel(liveSourceTag);
+        playbackRetry.invalidate();
+        cancelPlaybackRetry();
         mHandler.removeCallbacks(mAutoReloadRun);
-        // 后台不预加载:省流量,也别留一路连接在后台挂着
         mHandler.removeCallbacks(mPreloadRun);
         mHandler.removeCallbacks(mPreloadRefreshRun);
         preloadScheduled = false;
@@ -555,16 +545,25 @@ public class LiveActivity extends BaseActivity implements LiveLineSelectHost, Li
             mVideoView.cancelPreload();
             mVideoView.pause();
         }
+        super.onPause();
     }
 
     @Override
     protected void onDestroy() {
+        pageActive = false;
+        sourceLoadGeneration++;
+        HttpClient.cancel(liveSourceTag);
+        playbackRetry.invalidate();
+        cancelPlaybackRetry();
         mHandler.removeCallbacksAndMessages(null);
-        super.onDestroy();
         if (mVideoView != null) {
+            mVideoView.setOnPreloadListener(null);
             mVideoView.release();
             mVideoView = null;
         }
+        channel_Name = null;
+        currentLiveChannelItem = null;
+        super.onDestroy();
     }
 
     private void showChannelList() {
@@ -606,21 +605,26 @@ public class LiveActivity extends BaseActivity implements LiveLineSelectHost, Li
     };
 
     private boolean playChannel(int channelGroupIndex, int liveChannelIndex, boolean changeSource) {
+        return playChannel(channelGroupIndex, liveChannelIndex, changeSource, false);
+    }
+
+    private boolean playChannel(int channelGroupIndex, int liveChannelIndex, boolean changeSource, boolean automaticRetry) {
+        if (!pageActive || mVideoView == null || isFinishing() || isDestroyed()) return false;
         if (changeSource) {
-            // 只切线路不换台:当前频道可能还没选好(切组瞬间/刷新后),别直接 getSourceNum() 炸空指针
             if (currentLiveChannelItem == null) return false;
-            if (currentLiveChannelItem.getSourceNum() == 1) {
-                return true;
-            }
         } else {
-            // 组/台下标必须都合法:刷新频道表后总量可能变少,旧下标直接 get() 会越界
             if (channelGroupIndex < 0 || channelGroupIndex >= liveChannelGroupList.size()) return false;
             ArrayList<LiveChannelItem> channels = getLiveChannels(channelGroupIndex);
             if (liveChannelIndex < 0 || liveChannelIndex >= channels.size()) return false;
-            if (channelGroupIndex == currentChannelGroupIndex && liveChannelIndex == currentLiveChannelIndex) {
-                return true;
-            }
+            int state = mVideoView.getCurrentPlayState();
+            if (channelGroupIndex == currentChannelGroupIndex && liveChannelIndex == currentLiveChannelIndex
+                    && state != VideoView.STATE_IDLE && state != VideoView.STATE_ERROR
+                    && state != VideoView.STATE_PLAYBACK_COMPLETED) return true;
         }
+        cancelPlaybackRetry();
+        playbackRetry.begin(automaticRetry);
+        mHandler.removeCallbacks(mPreloadRun);
+        preloadScheduled = false;
         // 换台前先看这个台有没有自己的内核/渲染配置(改了就必须重建,不能复用实例)
         boolean kernelChanged = false;
         if (!changeSource) {
@@ -651,10 +655,9 @@ public class LiveActivity extends BaseActivity implements LiveLineSelectHost, Li
                         + (currentLiveChannelItem.getSourceIndex() + 1) + "/"
                         + currentLiveChannelItem.getSourceNum() + "]");
 
-        // 起播三条路,从快到慢:
-        // 1) 预加载命中 → 直接把提前备好的实例扶正(不重建播放器、不重建 Surface)
-        // 2) 没命中 → 复用当前实例 reset 换源(省掉实例重建和 TextureView 重建)
-        // 3) 内核换了/实例不可用 → 老路径:销毁重建
+        if (!url.equals(mVideoView.getPreloadedUrl()) || !mVideoView.isPreloadUsable()) {
+            mVideoView.cancelPreload();
+        }
         boolean promoted = !kernelChanged
                 && LiveConfig.preloadEnabled()
                 && LiveConfig.channelPlayerConfig(currentLiveChannelItem.getChannelName()) == null
@@ -668,9 +671,6 @@ public class LiveActivity extends BaseActivity implements LiveLineSelectHost, Li
             mVideoView.setUrl(url);
         }
         mVideoView.start();
-
-        // 当前台起播稳定后,提前把下一个台准备好(抖音式预加载)
-        schedulePreloadNeighbor(PRELOAD_DELAY_MS);
         return true;
     }
 
@@ -771,32 +771,36 @@ public class LiveActivity extends BaseActivity implements LiveLineSelectHost, Li
 
             @Override
             public void playStateChanged(int playState) {
+                if (!pageActive || mVideoView == null) return;
                 switch (playState) {
                     case VideoView.STATE_IDLE:
                     case VideoView.STATE_PAUSED:
+                        cancelPlaybackRetry();
                         break;
-                    case VideoView.STATE_PREPARED:
-                        currentLiveChangeSourceTimes = 0;
-                        mHandler.removeCallbacks(mConnectTimeoutChangeSourceRun);
+                    case VideoView.STATE_PLAYING:
+                        playbackRetry.onPlaying();
+                        cancelPlaybackRetry();
+                        schedulePreloadNeighbor(PRELOAD_DELAY_MS);
+                        scheduleUpdateCheck();
                         break;
                     case VideoView.STATE_BUFFERED:
-                    case VideoView.STATE_PLAYING:
-                        currentLiveChangeSourceTimes = 0;
-                        mHandler.removeCallbacks(mConnectTimeoutChangeSourceRun);
-                        // 画面出来了才预加载下一个台,免得和当前台的起流抢带宽
+                        cancelPlaybackRetry();
                         schedulePreloadNeighbor(PRELOAD_DELAY_MS);
-                        // 起播稳定后再查更新:别和首屏抢带宽/弹窗抢焦点
-                        scheduleUpdateCheck();
                         break;
                     case VideoView.STATE_ERROR:
                     case VideoView.STATE_PLAYBACK_COMPLETED:
-                        mHandler.removeCallbacks(mConnectTimeoutChangeSourceRun);
-                        mHandler.postDelayed(mConnectTimeoutChangeSourceRun, 2000);
+                        mHandler.removeCallbacks(mPreloadRun);
+                        preloadScheduled = false;
+                        mVideoView.cancelPreload();
+                        schedulePlaybackRetry(2000L);
                         break;
+                    case VideoView.STATE_PREPARED:
                     case VideoView.STATE_PREPARING:
                     case VideoView.STATE_BUFFERING:
-                        mHandler.removeCallbacks(mConnectTimeoutChangeSourceRun);
-                        mHandler.postDelayed(mConnectTimeoutChangeSourceRun, (LiveConfig.connectTimeout() + 1) * 5000);
+                        mHandler.removeCallbacks(mPreloadRun);
+                        preloadScheduled = false;
+                        if (playState == VideoView.STATE_BUFFERING) mVideoView.cancelPreload();
+                        schedulePlaybackRetry((LiveConfig.connectTimeout() + 1) * 5000L);
                         break;
                 }
             }
@@ -823,27 +827,31 @@ public class LiveActivity extends BaseActivity implements LiveLineSelectHost, Li
         mVideoView.setProgressManager(null);
     }
 
-    @NonNull
-    private Runnable mConnectTimeoutChangeSourceRun = new Runnable() {
-        @Override
-        public void run() {
-            // 这是个延时任务:2 秒后再跑时当前频道可能已经被清掉(刷新/退出),
-            // 不判空就会在 currentLiveChannelItem.getSourceNum() 上炸 NPE
-            if (currentLiveChannelItem == null || mVideoView == null) return;
-            currentLiveChangeSourceTimes++;
-            if (currentLiveChannelItem.getSourceNum() == currentLiveChangeSourceTimes) {
-                // 当前频道所有线路都失败:停止播放,不自动切下一个频道
-                currentLiveChangeSourceTimes = 0;
-                try {
-                    mVideoView.release();
-                } catch (Throwable ignored) {
-                }
+    private void cancelPlaybackRetry() {
+        if (connectTimeoutTask != null) mHandler.removeCallbacks(connectTimeoutTask);
+        connectTimeoutTask = null;
+    }
+
+    private void schedulePlaybackRetry(long delayMs) {
+        cancelPlaybackRetry();
+        if (!pageActive || currentLiveChannelItem == null || mVideoView == null) return;
+        final long request = playbackRetry.generation();
+        connectTimeoutTask = () -> {
+            connectTimeoutTask = null;
+            if (!pageActive || !playbackRetry.isCurrent(request)
+                    || currentLiveChannelItem == null || mVideoView == null) return;
+            if (!playbackRetry.tryNextSource(currentLiveChannelItem.getSourceNum())) {
+                playbackRetry.invalidate();
+                mVideoView.release();
                 AppBubble.toastLong("当前频道无可用线路,请手动切换频道");
-            } else {
-                playNextSource();
+                return;
             }
-        }
-    };
+            currentLiveChannelItem.nextSource();
+            playChannel(currentChannelGroupIndex, currentLiveChannelIndex, true, true);
+            updateLineText();
+        };
+        mHandler.postDelayed(connectTimeoutTask, delayMs);
+    }
 
     private void initChannelGroupView() {
         mChannelGroupView.setHasFixedSize(true);
@@ -863,6 +871,7 @@ public class LiveActivity extends BaseActivity implements LiveLineSelectHost, Li
     }
 
     private void selectChannelGroup(int groupIndex, boolean focus, int liveChannelIndex) {
+        if (groupIndex < 0 || groupIndex >= liveChannelGroupList.size()) return;
         if (focus) {
             liveChannelGroupAdapter.setFocusedGroupIndex(groupIndex);
             liveChannelItemAdapter.setFocusedChannelIndex(-1);
@@ -922,16 +931,8 @@ public class LiveActivity extends BaseActivity implements LiveLineSelectHost, Li
                 showEmpty();
                 return;
             }
-            // 先用上次成功拉到的频道表上屏(冷启动不用等网络),随后静默换成最新的
-            if (loadLivesFromCache(url)) {
-                AppLog.log("直播", "冷启动命中频道缓存,先上屏再后台刷新");
-                showSuccess();
-                initLiveState();
-                reloadFailCount = 0;
-                scheduleNextAutoReload(1500L);
-                return;
-            }
-            loadLivesFromUrl(url, null, true);
+            showLoading();
+            loadLivesFromCache(url);
             return;
         }
 
@@ -984,20 +985,20 @@ public class LiveActivity extends BaseActivity implements LiveLineSelectHost, Li
      *                       false = 只把新频道表灌进列表,不打断正在看的台(定时静默刷新走这条)
      */
     private void loadLivesFromUrl(final String url, final List<LiveChannelGroup> fallback, final boolean resumePlayback) {
-        if (channelLoading) return;
+        if (!pageActive || channelLoading) return;
         channelLoading = true;
-        // 只有"还没有任何频道在播"(首屏/上次失败)才铺满屏加载态;已经在看电视时刷新不顶掉画面
+        final long request = ++sourceLoadGeneration;
         if (resumePlayback && currentLiveChannelItem == null) showLoading();
         AppLog.log("直播", "加载直播源: " + url);
-        HttpClient.get(url, null, new HCallBack() {
+        HttpClient.get(url, liveSourceTag, new HCallBack() {
 
             @Override
             public void onSuccess(String content) {
-                // 解析 900+ 个台 + 重新分组放后台线程:HttpClient 的回调是投递到主线程的,
-                // 直接在这里解析会把主线程占住几百毫秒 —— 换台正好撞上就是"卡死"
+                if (!isSourceLoadCurrent(request)) return;
                 LiveSourceParser.parseAsync(content, mHandler, new LiveSourceParser.Callback() {
                     @Override
                     public void onParsed(LiveSourceParser.Result result) {
+                        if (!isSourceLoadCurrent(request)) return;
                         if (result == null) {
                             channelLoading = false;
                             AppLog.log("直播", "解析失败: 内容不是可用的频道表");
@@ -1007,6 +1008,8 @@ public class LiveActivity extends BaseActivity implements LiveLineSelectHost, Li
                             return;
                         }
                         try {
+                            String playingGroup = currentChannelGroupIndex >= 0 && currentChannelGroupIndex < liveChannelGroupList.size()
+                                    ? liveChannelGroupList.get(currentChannelGroupIndex).getGroupName() : null;
                             com.github.tvbox.osc.spiderapi.LiveChannelConfigProviders.get().loadLives(result.grouped);
                             List<LiveChannelGroup> list = com.github.tvbox.osc.spiderapi.LiveChannelConfigProviders.get().getChannelGroupList();
                             if (list.isEmpty()) {
@@ -1014,14 +1017,13 @@ public class LiveActivity extends BaseActivity implements LiveLineSelectHost, Li
                                 useFallbackOrFail(fallback, "频道列表为空");
                                 return;
                             }
-                            liveChannelGroupList.clear();
-                            liveChannelGroupList.addAll(list);
+                            liveChannelGroupList = new ArrayList<>(list);
+                            channelGroupPasswordConfirmed.clear();
 
                             channelLoading = false;
                             lastChannelLoadedAt = SystemClock.elapsedRealtime();
                             reloadFailCount = 0;
-                            // 落盘:下次冷启动不用等网络,直接用这份先上屏
-                            saveLivesCache(url, result.raw.toString());
+                            LiveSourceParser.saveCacheAsync(liveCacheFile(url), result.raw);
                             scheduleNextAutoReload(AUTO_RELOAD_INTERVAL_MS);
 
                             com.github.tvbox.osc.log.LogStore.log(com.github.tvbox.osc.log.Category.OTHER,
@@ -1038,7 +1040,7 @@ public class LiveActivity extends BaseActivity implements LiveLineSelectHost, Li
                                 }
                                 initLiveState();
                             } else {
-                                refreshChannelListOnly();
+                                refreshChannelListOnly(playingGroup);
                             }
                         } catch (Throwable th) {
                             th.printStackTrace();
@@ -1054,6 +1056,7 @@ public class LiveActivity extends BaseActivity implements LiveLineSelectHost, Li
 
             @Override
             public void onError(Throwable e) {
+                if (!isSourceLoadCurrent(request)) return;
                 channelLoading = false;
                 AppLog.log("直播", "加载失败: " + (e == null ? "null" : e.getMessage()));
                 com.github.tvbox.osc.log.LogStore.log(com.github.tvbox.osc.log.Category.OTHER,
@@ -1063,25 +1066,40 @@ public class LiveActivity extends BaseActivity implements LiveLineSelectHost, Li
         });
     }
 
-    /** 静默刷新:只把新频道表换进适配器,不碰播放器(避免看着看着被强制重开一次流) */
-    private void refreshChannelListOnly() {
-        // 列表换了以后,按频道名把"当前在看的是第几个"重新对上,否则高亮和上下换台会错位
-        if (currentLiveChannelItem != null && currentChannelGroupIndex >= 0
-                && currentChannelGroupIndex < liveChannelGroupList.size()) {
-            for (LiveChannelItem item : liveChannelGroupList.get(currentChannelGroupIndex).getLiveChannels()) {
-                if (currentLiveChannelItem.getChannelName().equals(item.getChannelName())) {
-                    currentLiveChannelItem = item;
-                    currentLiveChannelIndex = item.getChannelIndex();
-                    channel_Name = item;
-                    break;
+    private boolean isSourceLoadCurrent(long request) {
+        return pageActive && request == sourceLoadGeneration && !isFinishing() && !isDestroyed();
+    }
+
+    private void refreshChannelListOnly(String playingGroup) {
+        String channelName = currentLiveChannelItem == null ? null : currentLiveChannelItem.getChannelName();
+        int[] position = LiveChannelNav.findChannel(liveChannelGroupList, playingGroup, channelName);
+        currentChannelGroupIndex = position[0];
+        currentLiveChannelIndex = position[1];
+        if (currentChannelGroupIndex >= 0) {
+            LiveChannelItem item = liveChannelGroupList.get(currentChannelGroupIndex).getLiveChannels().get(currentLiveChannelIndex);
+            int source = item.getChannelUrls().indexOf(currentLiveChannelItem.getUrl());
+            item.setSourceIndex(Math.max(0, source));
+            currentLiveChannelItem = item;
+            channel_Name = item;
+            updateLineText();
+            if (source < 0) {
+                // 正在播的旧地址已不在新线路集合里:旧流的失败次数不能算到新线路上,重新计数;
+                // 旧流若已挂起/出错则补挂一次超时,确保会切到新集合里未播过的线路
+                playbackRetry.begin(false);
+                int state = mVideoView == null ? VideoView.STATE_IDLE : mVideoView.getCurrentPlayState();
+                if (state == VideoView.STATE_PREPARING || state == VideoView.STATE_BUFFERING || state == VideoView.STATE_PREPARED) {
+                    schedulePlaybackRetry((LiveConfig.connectTimeout() + 1) * 5000L);
+                } else if (state == VideoView.STATE_ERROR || state == VideoView.STATE_PLAYBACK_COMPLETED) {
+                    schedulePlaybackRetry(2000L);
                 }
             }
         }
+        // 已移除的频道可继续播旧流，但其旧下标不能再用于新频道表。
+        int visibleGroup = currentChannelGroupIndex >= 0 ? currentChannelGroupIndex : getFirstNoPasswordChannelGroup();
         liveChannelGroupAdapter.setNewData(liveChannelGroupList);
-        if (currentChannelGroupIndex >= 0 && currentChannelGroupIndex < liveChannelGroupList.size()) {
-            liveChannelItemAdapter.setNewData(getLiveChannels(currentChannelGroupIndex));
-            liveChannelItemAdapter.setSelectedChannelIndex(currentLiveChannelIndex);
-        }
+        liveChannelGroupAdapter.setSelectedGroupIndex(visibleGroup);
+        liveChannelItemAdapter.setNewData(getLiveChannels(visibleGroup));
+        liveChannelItemAdapter.setSelectedChannelIndex(currentLiveChannelIndex);
     }
 
     /**
@@ -1164,12 +1182,13 @@ public class LiveActivity extends BaseActivity implements LiveLineSelectHost, Li
     }
 
     private void showPasswordDialog(int groupIndex, int liveChannelIndex) {
-
+        final LiveChannelGroup group = liveChannelGroupList.get(groupIndex);
         LivePasswordDialog dialog = new LivePasswordDialog(this);
         dialog.setOnListener(new LivePasswordDialog.OnListener() {
             @Override
             public void onChange(String password) {
-                if (password.equals(liveChannelGroupList.get(groupIndex).getGroupPassword())) {
+                if (!pageActive || groupIndex >= liveChannelGroupList.size() || liveChannelGroupList.get(groupIndex) != group) return;
+                if (password.equals(group.getGroupPassword())) {
                     channelGroupPasswordConfirmed.add(groupIndex);
                     loadChannelGroupDataAndPlay(groupIndex, liveChannelIndex);
                 } else {
@@ -1223,6 +1242,7 @@ public class LiveActivity extends BaseActivity implements LiveLineSelectHost, Li
     }
 
     private ArrayList<LiveChannelItem> getLiveChannels(int groupIndex) {
+        if (groupIndex < 0 || groupIndex >= liveChannelGroupList.size()) return new ArrayList<>();
         if (LiveChannelAuth.needInputPassword(liveChannelGroupList, channelGroupPasswordConfirmed, groupIndex)) {
             return new ArrayList<>();
         }
@@ -1238,13 +1258,21 @@ public class LiveActivity extends BaseActivity implements LiveLineSelectHost, Li
      *                   只在组内循环会出现"滑了半天没反应"(单台组更是原地不动)
      */
     private Integer[] getNextChannel(int direction, boolean crossGroup) {
+        // 当前频道被刷新移除后双下标为 -1:以列表里高亮的可见组为起点恢复导航,
+        // 否则默认"不跨组"时上下键会一直拿到 {-1,-1} 而失效
+        int group = currentChannelGroupIndex;
+        int channel = currentLiveChannelIndex;
+        if (group < 0 || group >= liveChannelGroupList.size()) {
+            group = liveChannelGroupAdapter.getSelectedGroupIndex();
+            channel = -1;
+        }
         // 跨组/加密跳过/回卷决策已抽到 LiveChannelNav(纯逻辑,防死循环兜底)
         int[] next = LiveChannelNav.next(direction,
                 liveChannelGroupList.size(),
-                group -> getLiveChannels(group).size(),
-                group -> !liveChannelGroupList.get(group).getGroupPassword().isEmpty(),
-                currentChannelGroupIndex,
-                currentLiveChannelIndex,
+                g -> getLiveChannels(g).size(),
+                g -> !liveChannelGroupList.get(g).getGroupPassword().isEmpty(),
+                group,
+                channel,
                 crossGroup);
         return new Integer[]{next[0], next[1]};
     }
@@ -1271,18 +1299,20 @@ public class LiveActivity extends BaseActivity implements LiveLineSelectHost, Li
 
     /** 安排一次"预加载下一个台";已有待执行任务时不重复排(频繁 buffer 回调不会把定时器一直往后推) */
     private void schedulePreloadNeighbor(long delayMs) {
-        if (!LiveConfig.preloadEnabled()) return;
+        if (!canPreloadNeighbor() || !LiveConfig.preloadEnabled()) return;
         if (preloadScheduled) return;
         preloadScheduled = true;
         mHandler.postDelayed(mPreloadRun, Math.max(200L, delayMs));
     }
 
-    /**
-     * 预加载"下一次换台最可能去的那个台"。
-     * 只做 prepare(静音、不出画面),换台时由 VideoView 直接把实例扶正,省掉建连和探测。
-     */
+    private boolean canPreloadNeighbor() {
+        if (!pageActive || mVideoView == null || isFinishing() || isDestroyed()) return false;
+        int state = mVideoView.getCurrentPlayState();
+        return (state == VideoView.STATE_PLAYING || state == VideoView.STATE_BUFFERED) && mVideoView.isPlaying();
+    }
+
     private void preloadNeighborChannel() {
-        if (mVideoView == null || isFinishing() || isDestroyed()) return;
+        if (!canPreloadNeighbor()) return;
         if (!LiveConfig.preloadEnabled()) {
             mVideoView.cancelPreload();
             return;
@@ -1459,6 +1489,8 @@ public class LiveActivity extends BaseActivity implements LiveLineSelectHost, Li
      */
     @Override
     public void switchingLine2Replay(int position){
+        if (!pageActive || currentLiveChannelItem == null || position < 0
+                || position >= currentLiveChannelItem.getSourceNum()) return;
         currentLiveChannelItem.setSourceIndex(position);
         playChannel(currentChannelGroupIndex, currentLiveChannelIndex,true);
         updateLineText();
@@ -1479,6 +1511,11 @@ public class LiveActivity extends BaseActivity implements LiveLineSelectHost, Li
      */
     @Override
     public void changePlayer(int position){
+        if (!pageActive || mVideoView == null || currentLiveChannelItem == null) return;
+        cancelPlaybackRetry();
+        playbackRetry.begin(false);
+        mHandler.removeCallbacks(mPreloadRun);
+        preloadScheduled = false;
         mVideoView.release();
         livePlayerManager.changeLivePlayerType(mVideoView, position, currentLiveChannelItem.getChannelName());
         mVideoView.setUrl(currentLiveChannelItem.getUrl());

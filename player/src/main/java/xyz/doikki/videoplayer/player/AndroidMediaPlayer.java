@@ -6,6 +6,7 @@ import android.media.AudioManager;
 import android.media.MediaPlayer;
 import android.net.Uri;
 import android.os.Build;
+import android.os.Looper;
 import android.view.Surface;
 import android.view.SurfaceHolder;
 
@@ -23,6 +24,7 @@ public class AndroidMediaPlayer extends AbstractPlayer implements MediaPlayer.On
     private int mBufferedPercent;
     private Context mAppContext;
     private boolean mIsPreparing;
+    private boolean mPrepared;
 
     public AndroidMediaPlayer(Context context) {
         mAppContext = context.getApplicationContext();
@@ -46,7 +48,7 @@ public class AndroidMediaPlayer extends AbstractPlayer implements MediaPlayer.On
         try {
             mMediaPlayer.setDataSource(mAppContext, Uri.parse(path), headers);
         } catch (Exception e) {
-            mPlayerEventListener.onError();
+            if (mPlayerEventListener != null) mPlayerEventListener.onError();
         }
     }
 
@@ -55,25 +57,32 @@ public class AndroidMediaPlayer extends AbstractPlayer implements MediaPlayer.On
         try {
             mMediaPlayer.setDataSource(fd.getFileDescriptor(), fd.getStartOffset(), fd.getLength());
         } catch (Exception e) {
-            mPlayerEventListener.onError();
+            if (mPlayerEventListener != null) mPlayerEventListener.onError();
         }
     }
 
     @Override
     public void start() {
+        mPlayWhenPrepared = true;
+        if (mMediaPlayer == null || !mPrepared || mPreloadOnly) return;
         try {
             mMediaPlayer.start();
+            if (!isVideo() && mPlayerEventListener != null) {
+                mPlayerEventListener.onInfo(MEDIA_INFO_RENDERING_START, 0);
+            }
         } catch (IllegalStateException e) {
-            mPlayerEventListener.onError();
+            if (mPlayerEventListener != null) mPlayerEventListener.onError();
         }
     }
 
     @Override
     public void pause() {
+        mPlayWhenPrepared = false;
+        if (mMediaPlayer == null || !mPrepared) return;
         try {
             mMediaPlayer.pause();
         } catch (IllegalStateException e) {
-            mPlayerEventListener.onError();
+            if (mPlayerEventListener != null) mPlayerEventListener.onError();
         }
     }
 
@@ -82,7 +91,7 @@ public class AndroidMediaPlayer extends AbstractPlayer implements MediaPlayer.On
         try {
             mMediaPlayer.stop();
         } catch (IllegalStateException e) {
-            mPlayerEventListener.onError();
+            if (mPlayerEventListener != null) mPlayerEventListener.onError();
         }
     }
 
@@ -90,15 +99,18 @@ public class AndroidMediaPlayer extends AbstractPlayer implements MediaPlayer.On
     public void prepareAsync() {
         try {
             mIsPreparing = true;
+            mPrepared = false;
             mMediaPlayer.prepareAsync();
         } catch (IllegalStateException e) {
-            mPlayerEventListener.onError();
+            if (mPlayerEventListener != null) mPlayerEventListener.onError();
         }
     }
 
     @Override
     public void reset() {
-        stop();
+        mIsPreparing = false;
+        mPrepared = false;
+        mBufferedPercent = 0;
         mMediaPlayer.reset();
         mMediaPlayer.setSurface(null);
         mMediaPlayer.setDisplay(null);
@@ -115,31 +127,42 @@ public class AndroidMediaPlayer extends AbstractPlayer implements MediaPlayer.On
         try {
             mMediaPlayer.seekTo((int) time);
         } catch (IllegalStateException e) {
-            mPlayerEventListener.onError();
+            if (mPlayerEventListener != null) mPlayerEventListener.onError();
         }
     }
 
     @Override
     public void release() {
-        mMediaPlayer.setOnErrorListener(null);
-        mMediaPlayer.setOnCompletionListener(null);
-        mMediaPlayer.setOnInfoListener(null);
-        mMediaPlayer.setOnBufferingUpdateListener(null);
-        mMediaPlayer.setOnPreparedListener(null);
-        mMediaPlayer.setOnVideoSizeChangedListener(null);
-        stop();
-        final MediaPlayer mediaPlayer = mMediaPlayer;
+        release(null);
+    }
+
+    @Override
+    public void release(Runnable completion) {
+        if (Looper.myLooper() != Looper.getMainLooper()) {
+            mMainHandler.post(() -> release(completion));
+            return;
+        }
+        if (!beginRelease(completion)) return;
+        final MediaPlayer player = mMediaPlayer;
         mMediaPlayer = null;
-        new Thread() {
-            @Override
-            public void run() {
-                try {
-                    mediaPlayer.release();
-                } catch (Exception e) {
-                    e.printStackTrace();
-                }
-            }
-        }.start();
+        mPlayerEventListener = null;
+        mPrepared = false;
+        mIsPreparing = false;
+        if (player != null) {
+            cleanupForRelease(() -> {
+                player.setOnErrorListener(null);
+                player.setOnCompletionListener(null);
+                player.setOnInfoListener(null);
+                player.setOnBufferingUpdateListener(null);
+                player.setOnPreparedListener(null);
+                player.setOnVideoSizeChangedListener(null);
+            });
+            cleanupForRelease(() -> player.setSurface(null));
+            cleanupForRelease(() -> player.setDisplay(null));
+        }
+        releaseOnExecutor(() -> {
+            if (player != null) player.release();
+        });
     }
 
     @Override
@@ -159,20 +182,14 @@ public class AndroidMediaPlayer extends AbstractPlayer implements MediaPlayer.On
 
     @Override
     public void setSurface(Surface surface) {
-        try {
-            mMediaPlayer.setSurface(surface);
-        } catch (Exception e) {
-            mPlayerEventListener.onError();
-        }
+        if (mMediaPlayer == null) return;
+        mMediaPlayer.setSurface(surface);
     }
 
     @Override
     public void setDisplay(SurfaceHolder holder) {
-        try {
-            mMediaPlayer.setDisplay(holder);
-        } catch (Exception e) {
-            mPlayerEventListener.onError();
-        }
+        if (mMediaPlayer == null) return;
+        mMediaPlayer.setDisplay(holder);
     }
 
     @Override
@@ -196,7 +213,7 @@ public class AndroidMediaPlayer extends AbstractPlayer implements MediaPlayer.On
             try {
                 mMediaPlayer.setPlaybackParams(mMediaPlayer.getPlaybackParams().setSpeed(speed));
             } catch (Exception e) {
-                mPlayerEventListener.onError();
+                if (mPlayerEventListener != null) mPlayerEventListener.onError();
             }
         }
     }
@@ -208,7 +225,7 @@ public class AndroidMediaPlayer extends AbstractPlayer implements MediaPlayer.On
             try {
                 return mMediaPlayer.getPlaybackParams().getSpeed();
             } catch (Exception e) {
-                mPlayerEventListener.onError();
+                if (mPlayerEventListener != null) mPlayerEventListener.onError();
             }
         }
         return 1f;
@@ -222,17 +239,18 @@ public class AndroidMediaPlayer extends AbstractPlayer implements MediaPlayer.On
 
     @Override
     public boolean onError(MediaPlayer mp, int what, int extra) {
-        mPlayerEventListener.onError();
+        if (mp == mMediaPlayer && mPlayerEventListener != null) mPlayerEventListener.onError();
         return true;
     }
 
     @Override
     public void onCompletion(MediaPlayer mp) {
-        mPlayerEventListener.onCompletion();
+        if (mp == mMediaPlayer && mPlayerEventListener != null) mPlayerEventListener.onCompletion();
     }
 
     @Override
     public boolean onInfo(MediaPlayer mp, int what, int extra) {
+        if (mp != mMediaPlayer || mPlayerEventListener == null) return true;
         //解决MEDIA_INFO_VIDEO_RENDERING_START多次回调问题
         if (what == AbstractPlayer.MEDIA_INFO_RENDERING_START) {
             if (mIsPreparing) {
@@ -247,16 +265,17 @@ public class AndroidMediaPlayer extends AbstractPlayer implements MediaPlayer.On
 
     @Override
     public void onBufferingUpdate(MediaPlayer mp, int percent) {
-        mBufferedPercent = percent;
+        if (mp == mMediaPlayer) mBufferedPercent = percent;
     }
 
     @Override
     public void onPrepared(MediaPlayer mp) {
-        mPlayerEventListener.onPrepared();
-        start();
-        // 修复播放纯音频时状态出错问题
-        if (!isVideo()) {
-            mPlayerEventListener.onInfo(AbstractPlayer.MEDIA_INFO_RENDERING_START, 0);
+        if (mp != mMediaPlayer || mPlayerEventListener == null) return;
+        mPrepared = true;
+        PlayerEventListener listener = mPlayerEventListener;
+        listener.onPrepared();
+        if (mp == mMediaPlayer && listener == mPlayerEventListener && !mPreloadOnly && mPlayWhenPrepared) {
+            start();
         }
     }
 
@@ -277,6 +296,7 @@ public class AndroidMediaPlayer extends AbstractPlayer implements MediaPlayer.On
 
     @Override
     public void onVideoSizeChanged(MediaPlayer mp, int width, int height) {
+        if (mp != mMediaPlayer || mPlayerEventListener == null) return;
         int videoWidth = mp.getVideoWidth();
         int videoHeight = mp.getVideoHeight();
         if (videoWidth != 0 && videoHeight != 0) {

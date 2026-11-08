@@ -157,6 +157,7 @@ public class IjkMediaPlayer extends IjkPlayer implements KernelTrackSupport {
     }
 
     public TrackInfo getTrackInfo() {
+        if (mMediaPlayer == null) return null;
         IjkTrackInfo[] trackInfo = mMediaPlayer.getTrackInfo();
         if (trackInfo == null) return null;
         TrackInfo data = new TrackInfo();
@@ -186,11 +187,11 @@ public class IjkMediaPlayer extends IjkPlayer implements KernelTrackSupport {
     }
 
     public void setTrack(int trackIndex) {
-        mMediaPlayer.selectTrack(trackIndex);
+        if (mMediaPlayer != null) mMediaPlayer.selectTrack(trackIndex);
     }
 
     public void setOnTimedTextListener(IMediaPlayer.OnTimedTextListener listener) {
-        mMediaPlayer.setOnTimedTextListener(listener);
+        if (mMediaPlayer != null) mMediaPlayer.setOnTimedTextListener(listener);
     }
 
     // ── KernelTrackSupport（⑥ 适配层：PlayerTrackHelper 不再 instanceof 本类）──
@@ -211,10 +212,14 @@ public class IjkMediaPlayer extends IjkPlayer implements KernelTrackSupport {
 
     @Override
     public void setOnSubtitleListener(PlayerTrackHelper.SubtitleListener listener) {
-        if (listener == null) return;
+        if (listener == null) {
+            setOnTimedTextListener(null);
+            return;
+        }
         setOnTimedTextListener(new IMediaPlayer.OnTimedTextListener() {
             @Override
             public void onTimedText(IMediaPlayer mp, IjkTimedText text) {
+                if (mp != mMediaPlayer) return;
                 try {
                     listener.onSubtitle(text == null ? null : text.getText());
                 } catch (Throwable th) {

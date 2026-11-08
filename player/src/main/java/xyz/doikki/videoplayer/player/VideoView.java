@@ -9,6 +9,8 @@ import android.graphics.Bitmap;
 import android.graphics.Color;
 import android.net.Uri;
 import android.os.Build;
+import android.os.Handler;
+import android.os.Looper;
 import android.os.Parcelable;
 import android.os.SystemClock;
 import android.text.TextUtils;
@@ -46,6 +48,15 @@ public class VideoView<P extends AbstractPlayer> extends FrameLayout
 
     protected P mMediaPlayer;//播放器
     protected PlayerFactory<P> mPlayerFactory;//工厂类，用于实例化播放核心
+    private final Handler mMainHandler = new Handler(Looper.getMainLooper());
+    private int mPendingReleases;
+    private boolean mStartPending;
+    private boolean mResumePending;
+    private boolean mPauseRequested;
+    private boolean mSourceChanged;
+    private boolean mPreparing;
+    private long mPlaybackGeneration;
+    private long mPreloadGeneration;
     @Nullable
     protected BaseVideoController mVideoController;//控制器
 
@@ -213,9 +224,15 @@ public class VideoView<P extends AbstractPlayer> extends FrameLayout
      */
     @Override
     public void start() {
-        if (isInIdleState()
-                || isInStartAbortState()) {
+        mPauseRequested = false;
+        mResumePending = false;
+        if (mMediaPlayer == null || isInIdleState() || isInStartAbortState()) {
             startPlay();
+        } else if (mSourceChanged) {
+            startPrepare(true);
+        } else if (mPreparing) {
+            mMediaPlayer.setPlayWhenPrepared(true);
+            setPlayState(STATE_PREPARING);
         } else if (isInPlaybackState()) {
             startInPlaybackState();
         }
@@ -234,17 +251,53 @@ public class VideoView<P extends AbstractPlayer> extends FrameLayout
             return false;
         }
         //监听音频焦点改变
-        if (mEnableAudioFocus) {
+        if (mEnableAudioFocus && mAudioFocusHelper == null) {
             mAudioFocusHelper = new AudioFocusHelper(this);
         }
         //读取播放进度
         if (mProgressManager != null) {
             mCurrentPosition = mProgressManager.getSavedProgress(mProgressKey == null ? mUrl : mProgressKey);
         }
-        initPlayer();
-        addDisplay();
-        startPrepare(false);
+        mStartPending = true;
+        startPendingPlayer();
         return true;
+    }
+
+    private void startPendingPlayer() {
+        if (!mStartPending || mPauseRequested || mPendingReleases != 0) return;
+        mStartPending = false;
+        try {
+            initPlayer();
+            if (mRenderView == null) addDisplay();
+            else mRenderView.attachToPlayer(mMediaPlayer);
+            startPrepare(false);
+        } catch (RuntimeException e) {
+            L.e("start player 失败: " + e.getMessage());
+            releaseCurrentPlayer();
+            onError();
+        }
+    }
+
+    private void invalidatePlayerEvents() {
+        ++mPlaybackGeneration;
+        if (mMediaPlayer != null) mMediaPlayer.setPlayerEventListener(null);
+    }
+
+    private void releaseCurrentPlayer() {
+        invalidatePlayerEvents();
+        P player = mMediaPlayer;
+        mMediaPlayer = null;
+        mPreparing = false;
+        if (player != null) releasePlayer(player);
+    }
+
+    private void releasePlayer(P player) {
+        player.setPlayerEventListener(null);
+        ++mPendingReleases;
+        player.release(() -> mMainHandler.post(() -> {
+            --mPendingReleases;
+            startPendingPlayer();
+        }));
     }
 
     /**
@@ -275,8 +328,9 @@ public class VideoView<P extends AbstractPlayer> extends FrameLayout
      * 初始化播放器
      */
     protected void initPlayer() {
+        if (mPendingReleases != 0) throw new IllegalStateException("Player release pending");
         mMediaPlayer = mPlayerFactory.createPlayer(getContext());
-        mMediaPlayer.setPlayerEventListener(this);
+        mMediaPlayer.setPlayerEventListener(new MainPlayerEvent(mMediaPlayer, ++mPlaybackGeneration));
         setInitOptions();
         mMediaPlayer.initPlayer();
         setOptions();
@@ -302,6 +356,10 @@ public class VideoView<P extends AbstractPlayer> extends FrameLayout
      */
     protected void addDisplay() {
         if (mRenderView != null) {
+            if (mMediaPlayer != null) {
+                mMediaPlayer.setSurface(null);
+                mMediaPlayer.setDisplay(null);
+            }
             mPlayerContainer.removeView(mRenderView.getView());
             mRenderView.release();
         }
@@ -318,15 +376,36 @@ public class VideoView<P extends AbstractPlayer> extends FrameLayout
      * 开始准备播放（直接播放）
      */
     protected void startPrepare(boolean reset) {
+        if (mMediaPlayer == null) {
+            startPlay();
+            return;
+        }
+        invalidatePlayerEvents();
+        if (reset && !mMediaPlayer.canReuseForSwitch()) {
+            releaseCurrentPlayer();
+            mStartPending = true;
+            startPendingPlayer();
+            return;
+        }
         if (reset) {
             mMediaPlayer.reset();
             //重新设置option，media player reset之后，option会失效
             setOptions();
+            if (mRenderView != null) mRenderView.attachToPlayer(mMediaPlayer);
         }
+        P player = mMediaPlayer;
+        long generation = ++mPlaybackGeneration;
+        player.setPlayerEventListener(new MainPlayerEvent(player, generation));
+        player.setPreloadOnly(false);
+        player.setPlayWhenPrepared(!mPauseRequested);
+        mSourceChanged = false;
         if (prepareDataSource()) {
-            mMediaPlayer.prepareAsync();
+            mPreparing = true;
             setPlayState(STATE_PREPARING);
+            if (player != mMediaPlayer || generation != mPlaybackGeneration) return;
             setPlayerState(isFullScreen() ? PLAYER_FULL_SCREEN : isTinyScreen() ? PLAYER_TINY_SCREEN : PLAYER_NORMAL);
+            if (player != mMediaPlayer || generation != mPlaybackGeneration) return;
+            player.prepareAsync();
         }
     }
 
@@ -363,29 +442,32 @@ public class VideoView<P extends AbstractPlayer> extends FrameLayout
      */
     @Override
     public void pause() {
-        if (isInPlaybackState()
-                && mMediaPlayer.isPlaying()) {
+        mPauseRequested = true;
+        mResumePending |= mStartPending;
+        mStartPending = false;
+        cancelPreload();
+        if (mMediaPlayer != null && (mPreparing || isInPlaybackState())) {
+            mMediaPlayer.setPlayWhenPrepared(false);
             mMediaPlayer.pause();
             setPlayState(STATE_PAUSED);
-            if (mAudioFocusHelper != null && !isMute()) {
-                mAudioFocusHelper.abandonFocus();
-            }
-            mPlayerContainer.setKeepScreenOn(false);
         }
+        if (mAudioFocusHelper != null) mAudioFocusHelper.abandonFocus();
+        mPlayerContainer.setKeepScreenOn(false);
     }
 
     /**
      * 继续播放
      */
     public void resume() {
-        if (isInPlaybackState()
-                && !mMediaPlayer.isPlaying()) {
-            mMediaPlayer.start();
-            setPlayState(STATE_PLAYING);
-            if (mAudioFocusHelper != null && !isMute()) {
-                mAudioFocusHelper.requestFocus();
-            }
-            mPlayerContainer.setKeepScreenOn(true);
+        mPauseRequested = false;
+        if (mResumePending) {
+            mResumePending = false;
+            startPlay();
+        } else if (mPreparing && mMediaPlayer != null) {
+            mMediaPlayer.setPlayWhenPrepared(true);
+            setPlayState(STATE_PREPARING);
+        } else if (isInPlaybackState() && !mMediaPlayer.isPlaying()) {
+            startInPlaybackState();
         }
     }
 
@@ -393,42 +475,32 @@ public class VideoView<P extends AbstractPlayer> extends FrameLayout
      * 释放播放器
      */
     public void release() {
-        // 预加载实例一并释放，避免换页/退出后还留一个后台实例占解码器和连接
+        mStartPending = false;
+        mResumePending = false;
+        mPauseRequested = true;
         cancelPreload();
-        if (!isInIdleState()) {
-            //释放播放器
-            if (mMediaPlayer != null) {
-                mMediaPlayer.release();
-                mMediaPlayer = null;
-            }
-            //释放renderView
-            if (mRenderView != null) {
-                mPlayerContainer.removeView(mRenderView.getView());
-                mRenderView.release();
-                mRenderView = null;
-            }
-            //释放Assets资源
-            if (mAssetFileDescriptor != null) {
-                try {
-                    mAssetFileDescriptor.close();
-                } catch (IOException e) {
-                    e.printStackTrace();
-                }
-            }
-            //关闭AudioFocus监听
-            if (mAudioFocusHelper != null) {
-                mAudioFocusHelper.abandonFocus();
-                mAudioFocusHelper = null;
-            }
-            //关闭屏幕常亮
-            mPlayerContainer.setKeepScreenOn(false);
-            //保存播放进度
-            saveProgress();
-            //重置播放进度
-            mCurrentPosition = 0;
-            //切换转态
-            setPlayState(STATE_IDLE);
+        releaseCurrentPlayer();
+        if (mRenderView != null) {
+            mPlayerContainer.removeView(mRenderView.getView());
+            mRenderView.release();
+            mRenderView = null;
         }
+        if (mAssetFileDescriptor != null) {
+            try {
+                mAssetFileDescriptor.close();
+            } catch (IOException e) {
+                e.printStackTrace();
+            }
+            mAssetFileDescriptor = null;
+        }
+        if (mAudioFocusHelper != null) {
+            mAudioFocusHelper.abandonFocus();
+            mAudioFocusHelper = null;
+        }
+        mPlayerContainer.setKeepScreenOn(false);
+        saveProgress();
+        mCurrentPosition = 0;
+        setPlayState(STATE_IDLE);
     }
 
     // ------------------------------------------------------------------
@@ -442,27 +514,21 @@ public class VideoView<P extends AbstractPlayer> extends FrameLayout
     /**
      * 预加载一个地址：另起一个播放器实例，静音、不挂画面，只把「建连 + 解封装 + 首包」做完。
      * <p>
-     * 不做 start()：预加载实例不解码、不出声（软解下同时跑两路 1080p 解码会把 CPU 吃满），
-     * 换台时用 {@link #promotePreloaded()} 扶正后再 start()，省掉的是冷启动最贵的建连和探测。
+     * 内核显式禁止 prepare 后自动起播；扶正后再 start()，不把后台播放当作预加载。
      * <p>
      * 幂等：同一地址已在预加载且未过期时直接返回 true，可放心反复调用。
      *
      * @return true 表示预加载已发起（或已在预加载）；false 表示不适用于该地址
      */
     public synchronized boolean preload(String url, Map<String, String> headers) {
-        if (TextUtils.isEmpty(url)) return false;
-        // 正在播这个台就不用预加载了
+        if (TextUtils.isEmpty(url) || mPauseRequested || mStartPending || mPendingReleases != 0) return false;
         if (mMediaPlayer != null && url.equals(mUrl) && isInPlaybackState()) return false;
-        if (mPreloadPlayer != null && url.equals(mPreloadUrl) && isPreloadUsable()) return true;
+        if (mPreloadPlayer != null && url.equals(mPreloadUrl) && getPreloadAgeMs() < PRELOAD_TTL_MS) return true;
 
         cancelPreload();
-        P player = null;
+        if (mPendingReleases != 0) return false;
         try {
-            player = mPlayerFactory.createPlayer(getContext());
-            player.setPlayerEventListener(new PreloadPlayerEvent(url));
-            player.initPlayer();
-            player.setVolume(0f, 0f);          // 预加载实例必须静音，否则会和正在播的台串音
-
+            P player = mPlayerFactory.createPlayer(getContext());
             mPreloadPlayer = player;
             mPreloadUrl = url;
             mPreloadHeaders = headers;
@@ -470,34 +536,33 @@ public class VideoView<P extends AbstractPlayer> extends FrameLayout
             mPreloadStartAt = SystemClock.elapsedRealtime();
             mPreloadVideoSize[0] = 0;
             mPreloadVideoSize[1] = 0;
-
+            player.setPlayerEventListener(new PreloadPlayerEvent(player, ++mPreloadGeneration, url));
+            player.setPreloadOnly(true);
+            player.setPlayWhenPrepared(false);
+            player.initPlayer();
+            player.setVolume(0f, 0f);
             player.setDataSource(url, headers);
             player.prepareAsync();
             return true;
         } catch (Throwable th) {
             L.e("preload 失败: " + th.getMessage());
-            if (mPreloadPlayer == player) {
-                cancelPreload();
-            }
+            cancelPreload();
             return false;
         }
     }
 
     /** 取消预加载并释放实例（页面退到后台/退出时必须调，否则会留一路后台连接） */
     public synchronized void cancelPreload() {
+        ++mPreloadGeneration;
         P player = mPreloadPlayer;
         mPreloadPlayer = null;
         mPreloadUrl = null;
         mPreloadHeaders = null;
         mPreloadPrepared = false;
         mPreloadStartAt = 0L;
-        if (player != null) {
-            try {
-                player.setPlayerEventListener(null);
-                player.release();
-            } catch (Throwable ignored) {
-            }
-        }
+        mPreloadVideoSize[0] = 0;
+        mPreloadVideoSize[1] = 0;
+        if (player != null) releasePlayer(player);
     }
 
     /** 预加载是否可用于扶正（已 prepare 完成且未过期） */
@@ -523,51 +588,54 @@ public class VideoView<P extends AbstractPlayer> extends FrameLayout
      * @return true 表示已扶正；false 表示没有可用的预加载（调用方应走普通起播）
      */
     public synchronized boolean promotePreloaded() {
-        if (!isPreloadUsable()) return false;
-
-        P promoted = mPreloadPlayer;
-        String url = mPreloadUrl;
-        Map<String, String> headers = mPreloadHeaders;
+        if (!isPreloadUsable() || mPauseRequested) return false;
+        // 必须先解绑旧核，不能在 native release 尚未结束时共享 Surface。
+        try {
+            if (mMediaPlayer != null) {
+                mMediaPlayer.setSurface(null);
+                mMediaPlayer.setDisplay(null);
+            }
+        } catch (RuntimeException e) {
+            L.e("promote detach 失败: " + e.getMessage());
+            return false;
+        }
+        mStartPending = false;
+        mResumePending = false;
+        releaseCurrentPlayer();
+        ++mPreloadGeneration;
+        mMediaPlayer = mPreloadPlayer;
+        mUrl = mPreloadUrl;
+        mHeaders = mPreloadHeaders;
+        mAssetFileDescriptor = null;
         mPreloadPlayer = null;
         mPreloadUrl = null;
         mPreloadHeaders = null;
         mPreloadPrepared = false;
         mPreloadStartAt = 0L;
-
-        // 旧实例只释放播放器，保留渲染视图：Surface 不动，切台时不会闪一下黑屏
-        if (mMediaPlayer != null) {
-            try {
-                mMediaPlayer.setPlayerEventListener(null);
-                mMediaPlayer.release();
-            } catch (Throwable ignored) {
-            }
-            mMediaPlayer = null;
-        }
-
-        mUrl = url;
-        mHeaders = headers;
-        mMediaPlayer = promoted;
-        mMediaPlayer.setPlayerEventListener(this);
+        mSourceChanged = false;
         mCurrentPosition = 0;
-
-        if (mRenderView == null) {
-            addDisplay();
-        } else {
-            // 关键：把预加载实例挂到现成的 Surface 上，第一帧几乎立刻就能画出来
-            mRenderView.attachToPlayer(mMediaPlayer);
-        }
-        setOptions();
-        // 预加载阶段解析到的宽高直接套用:否则换台后画面比例要等下一次回调才正确
-        if (mPreloadVideoSize[0] > 0 && mPreloadVideoSize[1] > 0) {
-            onVideoSizeChanged(mPreloadVideoSize[0], mPreloadVideoSize[1]);
+        mMediaPlayer.setPlayerEventListener(new MainPlayerEvent(mMediaPlayer, ++mPlaybackGeneration));
+        try {
+            mMediaPlayer.setPreloadOnly(false);
+            if (mRenderView == null) addDisplay();
+            else mRenderView.attachToPlayer(mMediaPlayer);
+            setOptions();
+            if (mPreloadVideoSize[0] > 0 && mPreloadVideoSize[1] > 0) {
+                onVideoSizeChanged(mPreloadVideoSize[0], mPreloadVideoSize[1]);
+            }
             mPreloadVideoSize[0] = 0;
             mPreloadVideoSize[1] = 0;
+            if (mEnableAudioFocus && mAudioFocusHelper == null) {
+                mAudioFocusHelper = new AudioFocusHelper(this);
+            }
+            setPlayState(STATE_PREPARED);
+            return true;
+        } catch (RuntimeException e) {
+            L.e("promote 失败: " + e.getMessage());
+            releaseCurrentPlayer();
+            onError();
+            return false;
         }
-        if (mEnableAudioFocus && mAudioFocusHelper == null) {
-            mAudioFocusHelper = new AudioFocusHelper(this);
-        }
-        setPlayState(STATE_PREPARED);
-        return true;
     }
 
     /** 地址命中预加载时扶正，不命中返回 false（调用方走普通起播） */
@@ -577,66 +645,107 @@ public class VideoView<P extends AbstractPlayer> extends FrameLayout
     }
 
     /**
-     * 快速换源：复用当前播放器实例与渲染 Surface，只 reset + 换地址 + prepareAsync。
-     * <p>
-     * 相比 {@code release() + setUrl() + start()}，省掉播放器实例重建和 TextureView 重建
-     * （这两步在换台卡顿里占比很高），画面还会保留上一帧直到新流出画，不会中间黑一下。
-     *
-     * @return false 表示当前没有可复用的实例（调用方应回退到 release() + setUrl() + start()）
+     * 换源：可复用内核走 reset，其余等待异步释放完成后重建；等待期间只保留最新地址。
+     * @return false 表示没有播放请求或换源失败，调用方可回退到 release/setUrl/start。
      */
     public boolean switchUrl(String url, Map<String, String> headers) {
-        if (TextUtils.isEmpty(url) || mMediaPlayer == null || isInIdleState()) return false;
-        mUrl = url;
-        mHeaders = headers;
+        if (TextUtils.isEmpty(url) || (mMediaPlayer == null && !mStartPending && !mResumePending)) return false;
         try {
-            if (mRenderView == null) addDisplay();
-            mMediaPlayer.setPlayerEventListener(this);
+            setUrl(url, headers);
+            mCurrentPosition = 0;
+            mPauseRequested = false;
+            mResumePending = false;
+            cancelPreload();
+            if (mMediaPlayer != null && mRenderView == null) addDisplay();
             startPrepare(true);
-            // reset() 会把内核的 Surface 解绑，这里把现成的 Surface 重新挂回去，
-            // 否则换台后只有声音没有画面（这是复用实例相对 release+重建 唯一要补的一步）
-            if (mRenderView != null) mRenderView.attachToPlayer(mMediaPlayer);
             return true;
-        } catch (Throwable th) {
-            L.e("switchUrl 失败: " + th.getMessage());
+        } catch (RuntimeException e) {
+            L.e("switchUrl 失败: " + e.getMessage());
+            releaseCurrentPlayer();
+            onError();
             return false;
         }
     }
 
-    /** 预加载实例的事件只用来标记「就绪 / 失败」，绝不参与主播放器的状态机 */
-    private final class PreloadPlayerEvent implements AbstractPlayer.PlayerEventListener {
+    private final class MainPlayerEvent implements AbstractPlayer.PlayerEventListener {
+        private final P mEventPlayer;
+        private final long mGeneration;
 
-        private final String mEventUrl;
+        MainPlayerEvent(P player, long generation) {
+            mEventPlayer = player;
+            mGeneration = generation;
+        }
 
-        PreloadPlayerEvent(String url) {
-            mEventUrl = url;
+        private void dispatch(Runnable event) {
+            mMainHandler.post(() -> {
+                if (mEventPlayer == mMediaPlayer && mGeneration == mPlaybackGeneration) event.run();
+            });
         }
 
         @Override
         public void onPrepared() {
-            post(new Runnable() {
-                @Override
-                public void run() {
-                    if (mPreloadPlayer == null || !mEventUrl.equals(mPreloadUrl)) return;
-                    mPreloadPrepared = true;
-                    if (mOnPreloadListener != null) mOnPreloadListener.onPreloadReady(mEventUrl);
-                }
+            dispatch(VideoView.this::onPrepared);
+        }
+
+        @Override
+        public void onError() {
+            dispatch(VideoView.this::onError);
+        }
+
+        @Override
+        public void onCompletion() {
+            dispatch(VideoView.this::onCompletion);
+        }
+
+        @Override
+        public void onInfo(int what, int extra) {
+            dispatch(() -> VideoView.this.onInfo(what, extra));
+        }
+
+        @Override
+        public void onVideoSizeChanged(int width, int height) {
+            dispatch(() -> VideoView.this.onVideoSizeChanged(width, height));
+        }
+    }
+
+    /** 预加载事件不参与主播放器状态机，URL 相同也必须校验实例与代次。 */
+    private final class PreloadPlayerEvent implements AbstractPlayer.PlayerEventListener {
+        private final P mEventPlayer;
+        private final long mGeneration;
+        private final String mEventUrl;
+
+        PreloadPlayerEvent(P player, long generation, String url) {
+            mEventPlayer = player;
+            mGeneration = generation;
+            mEventUrl = url;
+        }
+
+        private void dispatch(Runnable event) {
+            mMainHandler.post(() -> {
+                if (mEventPlayer == mPreloadPlayer && mGeneration == mPreloadGeneration) event.run();
+            });
+        }
+
+        @Override
+        public void onPrepared() {
+            dispatch(() -> {
+                if (mPreloadPrepared) return;
+                mPreloadPrepared = true;
+                if (mOnPreloadListener != null) mOnPreloadListener.onPreloadReady(mEventUrl);
             });
         }
 
         @Override
         public void onError() {
-            post(new Runnable() {
-                @Override
-                public void run() {
-                    if (mPreloadPlayer == null || !mEventUrl.equals(mPreloadUrl)) return;
-                    cancelPreload();
-                    if (mOnPreloadListener != null) mOnPreloadListener.onPreloadFailed(mEventUrl);
-                }
+            dispatch(() -> {
+                cancelPreload();
+                if (mOnPreloadListener != null) mOnPreloadListener.onPreloadFailed(mEventUrl);
             });
         }
 
         @Override
         public void onCompletion() {
+            onError();
         }
 
         @Override
@@ -645,9 +754,10 @@ public class VideoView<P extends AbstractPlayer> extends FrameLayout
 
         @Override
         public void onVideoSizeChanged(int width, int height) {
-            // 预加载阶段记下来,扶正后一次性套用(否则画面比例要等新流的第一帧回调)
-            mPreloadVideoSize[0] = width;
-            mPreloadVideoSize[1] = height;
+            dispatch(() -> {
+                mPreloadVideoSize[0] = width;
+                mPreloadVideoSize[1] = height;
+            });
         }
     }
 
@@ -666,6 +776,7 @@ public class VideoView<P extends AbstractPlayer> extends FrameLayout
      */
     public boolean isInPlaybackState() {
         return mMediaPlayer != null
+                && !mPreparing && !mSourceChanged
                 && mCurrentPlayState != STATE_ERROR
                 && mCurrentPlayState != STATE_IDLE
                 && mCurrentPlayState != STATE_PREPARING
@@ -697,7 +808,9 @@ public class VideoView<P extends AbstractPlayer> extends FrameLayout
         if (resetPosition) {
             mCurrentPosition = 0;
         }
-        addDisplay();
+        mPauseRequested = false;
+        mResumePending = false;
+        if (mMediaPlayer != null) addDisplay();
         startPrepare(true);
     }
 
@@ -775,12 +888,19 @@ public class VideoView<P extends AbstractPlayer> extends FrameLayout
      */
     @Override
     public void onPrepared() {
-        setPlayState(STATE_PREPARED);
-        if (!isMute() && mAudioFocusHelper != null) {
-            mAudioFocusHelper.requestFocus();
-        }
-        if (mCurrentPosition > 0) {
-            seekTo(mCurrentPosition);
+        if (!mPreparing || mMediaPlayer == null) return;
+        P player = mMediaPlayer;
+        long generation = mPlaybackGeneration;
+        mPreparing = false;
+        setPlayState(mPauseRequested ? STATE_PAUSED : STATE_PREPARED);
+        if (player != mMediaPlayer || generation != mPlaybackGeneration) return;
+        if (mCurrentPosition > 0) player.seekTo(mCurrentPosition);
+        if (mPauseRequested) {
+            player.pause();
+            mPlayerContainer.setKeepScreenOn(false);
+        } else {
+            if (!player.isPlaying()) player.start();
+            if (!isMute() && mAudioFocusHelper != null) mAudioFocusHelper.requestFocus();
         }
     }
 
@@ -789,6 +909,7 @@ public class VideoView<P extends AbstractPlayer> extends FrameLayout
      */
     @Override
     public void onInfo(int what, int extra) {
+        if (mPauseRequested && what != AbstractPlayer.MEDIA_INFO_VIDEO_ROTATION_CHANGED) return;
         switch (what) {
             case AbstractPlayer.MEDIA_INFO_BUFFERING_START:
                 setPlayState(STATE_BUFFERING);
@@ -811,6 +932,11 @@ public class VideoView<P extends AbstractPlayer> extends FrameLayout
      */
     @Override
     public void onError() {
+        mStartPending = false;
+        mResumePending = false;
+        mPreparing = false;
+        invalidatePlayerEvents();
+        if (mMediaPlayer != null) mMediaPlayer.setPlayWhenPrepared(false);
         mPlayerContainer.setKeepScreenOn(false);
         setPlayState(STATE_ERROR);
     }
@@ -820,6 +946,8 @@ public class VideoView<P extends AbstractPlayer> extends FrameLayout
      */
     @Override
     public void onCompletion() {
+        invalidatePlayerEvents();
+        mPreparing = false;
         mPlayerContainer.setKeepScreenOn(false);
         mCurrentPosition = 0;
         if (mProgressManager != null) {
@@ -883,15 +1011,26 @@ public class VideoView<P extends AbstractPlayer> extends FrameLayout
      * @param headers 请求头
      */
     public void setUrl(String url, Map<String, String> headers) {
+        invalidateSource();
         mAssetFileDescriptor = null;
         mUrl = url;
         mHeaders = headers;
+    }
+
+    private void invalidateSource() {
+        invalidatePlayerEvents();
+        mSourceChanged = true;
+        if (mMediaPlayer != null) {
+            mMediaPlayer.setPlayWhenPrepared(false);
+            mMediaPlayer.pause();
+        }
     }
 
     /**
      * 用于播放assets里面的视频文件
      */
     public void setAssetFileDescriptor(AssetFileDescriptor fd) {
+        invalidateSource();
         mUrl = null;
         this.mAssetFileDescriptor = fd;
     }
